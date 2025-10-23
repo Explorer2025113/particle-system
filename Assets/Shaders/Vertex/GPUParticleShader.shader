@@ -1,3 +1,4 @@
+// Assets/Shaders/Vertex/GPUParticleShader.shader
 Shader "Unlit/GPUParticleShader"
 {
     Properties {}
@@ -45,24 +46,29 @@ Shader "Unlit/GPUParticleShader"
                 uint p_idx = _AliveIndices[v.instanceID];
                 Particle p = _Particles[p_idx];
 
-                // Billboard logic to make particles face the camera
+                // Billboard logic
                 float3 center = p.position.xyz;
                 float3 viewer = normalize(UnityWorldSpaceViewDir(center));
                 float3 up = mul((float3x3)unity_WorldToObject, float3(0,1,0));
                 float3 right = cross(viewer, up);
 
                 float lifeRatio = saturate(p.lifetime.x / p.lifetime.y);
-                float size = lerp(0.1, 0.05, lifeRatio); // 【修改】增加粒子大小，让它们更明显
+                // 根据生命周期调整大小，从大变小
+                float size = lerp(2.0, 0.5, lifeRatio);
                 float4 pos = float4(center + (v.vertex.x * right + v.vertex.y * up) * size, 1.0);
 
                 o.vertex = UnityObjectToClipPos(pos);
-                o.color = float4(p.color.rgb, p.color.a * (1 - lifeRatio)); // 使用粒子实际颜色
+                o.color = p.color;
                 return o;
             }
 
             fixed4 frag (v2f i) : SV_Target
             {
-                return i.color;
+                // 添加一个中心亮、边缘暗的效果，让粒子看起来更像点
+                float2 screenPos = i.vertex.xy / i.vertex.w;
+                float dist = length(screenPos);
+                float falloff = 1.0 - saturate(dist * 0.5);
+                return i.color * falloff;
             }
             ENDCG
         }

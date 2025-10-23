@@ -5,53 +5,143 @@
 
 #define THREAD_COUNT_1D 256
 
+// --- Structs ---
 struct Particle
 {
-    float4 lifetime; // x: current age, y: max lifetime
-    float4 velocity;
-    float4 position;
+    float4 lifetime; // x: age, y: maxLife
+    float4 velocity; // xyz: velocity
+    float4 position; // xyz: position
+    float4 color;    // rgba: color
+};
+
+struct Emitter
+{
+    int enabled;
+    int emissionRate;
+    float3 position;
+    float radius;
+    float3 initialVelocity;
+    float minInitialSpeed;
+    float maxInitialSpeed;
     float4 color;
 };
 
-// --- GPU Buffers ---
+struct ForceField
+{
+    int enabled;
+    float3 position;
+    float radius;
+    float strength;
+};
+
+
+// --- Buffers ---
 RWStructuredBuffer<Particle> _Particles;
 RWStructuredBuffer<uint> _DeadPool;
 RWStructuredBuffer<uint> _AliveIndices_A;
 RWStructuredBuffer<uint> _AliveIndices_B;
-RWStructuredBuffer<uint> _Counters;       // [0]=dead_count, [1]=alive_A_count, [2]=alive_B_count
+RWStructuredBuffer<uint> _Counters;
 RWStructuredBuffer<uint> _IndirectArgs;
+StructuredBuffer<Emitter> _Emitters;
+StructuredBuffer<ForceField> _ForceFields;
 
 // --- Uniforms ---
 float _DeltaTime;
 uint _PingPong_A;
 uint _PingPong_B;
 uint _EmissionCount;
+uint _EmitterIndex;
 float _MinLifetime;
 float _MaxLifetime;
-float _MinInitialSpeed;
-float _MaxInitialSpeed;
-float3 _EmitterPosition;
-float3 _EmitterDirection; // 用于随机模式
-float _EmitterRadius;
+float _Drag;
 float3 _Seeds;
-uint _AffectedByGravity;
 
-// 【新增】用于控制逻辑的 Uniforms
-uint _EmissionType;   // 0 for Random, 1 for Spiral
-float _SpiralForce;   // 螺旋力强度
-float _SpiralRadius;
-float _SpiralHeight;
-float _SpiralTurns;
+float3 _GlobalForce;
+bool _CurlNoiseEnabled;
+float _CurlNoiseScale;
+float _CurlNoiseStrength;
+int _ForceFieldCount;
 
+// 颜色控制参数
+bool _ColorOverLife;
+bool _VelocityToColor;
+float _MaxSpeedForColor;
 
+// --- Utility Functions ---
 float rand(float2 co)
 {
     return frac(sin(dot(co, float2(12.9898, 78.233))) * 43758.5453);
 }
 
-// =========================================================================
-// KERNEL 1: UpdateArgs
-// =========================================================================
+// --- Noise Functions for Curl Noise ---
+float3 mod289(float3 x) { return x - floor(x * (1.0 / 289.0)) * 289.0; }
+float4 mod289(float4 x) { return x - floor(x * (1.0 / 289.0)) * 289.0; }
+float4 permute(float4 x) { return mod289(((x*34.0)+1.0)*x); }
+float4 taylorInvSqrt(float4 r) { return 1.79284291400159 - 0.85373472095314 * r; }
+
+float snoise(float3 v)
+{
+    const float2 C = float2(1.0/6.0, 1.0/3.0);
+    const float4 D = float4(0.0, 0.5, 1.0, 2.0);
+    float3 i  = floor(v + dot(v, C.yyy));
+    float3 x0 = v - i + dot(i, C.xxx);
+    float3 g = step(x0.yzx, x0.xyz);
+    float3 l = 1.0 - g;
+    float3 i1 = min(g.xyz, l.zxy);
+    float3 i2 = max(g.xyz, l.zxy);
+    float3 x1 = x0 - i1 + C.xxx;
+    float3 x2 = x0 - i2 + C.yyy;
+    float3 x3 = x0 - D.yyy;
+    i = mod289(i);
+    float4 p = permute(permute(permute(i.z + float4(0.0, i1.z, i2.z, 1.0)) + i.y + float4(0.0, i1.y, i2.y, 1.0)) + i.x + float4(0.0, i1.x, i2.x, 1.0));
+    float3 ns = 0.714285714285714 * (2.0 * frac(p.xyz * 0.142857142857143) - 1.0);
+    float4 j = p - 49.0 * floor(p * (1.0/49.0));
+    float4 x_ = floor(j * (1.0/7.0));
+    float4 y_ = floor(j - 7.0 * x_);
+    float4 x = (x_ * 2.0 + 0.5) / 7.0 - 1.0;
+    float4 y = (y_ * 2.0 + 0.5) / 7.0 - 1.0;
+    float4 h = 1.0 - abs(x) - abs(y);
+    float4 b0 = float4(x.xy, y.xy);
+    float4 b1 = float4(x.zw, y.zw);
+    float4 s0 = floor(b0)*2.0 + 1.0;
+    float4 s1 = floor(b1)*2.0 + 1.0;
+    float4 sh = -step(h, 0.0);
+    float4 a0 = b0.xzyw + s0.xzyw*sh.xxyy;
+    float4 a1 = b1.xzyw + s1.xzyw*sh.zzww;
+    float3 p0 = float3(a0.xy,h.x);
+    float3 p1 = float3(a0.zw,h.y);
+    float3 p2 = float3(a1.xy,h.z);
+    float3 p3 = float3(a1.zw,h.w);
+    float4 norm = taylorInvSqrt(float4(dot(p0,p0), dot(p1,p1), dot(p2, p2), dot(p3,p3)));
+    p0 *= norm.x;
+    p1 *= norm.y;
+    p2 *= norm.z;
+    p3 *= norm.w;
+    float4 m = max(0.6 - float4(dot(x0,x0), dot(x1,x1), dot(x2,x2), dot(x3,x3)), 0.0);
+    m = m * m;
+    return 42.0 * dot(m*m, float4(dot(p0,x0), dot(p1,x1), dot(p2,x2), dot(p3,x3)));
+}
+
+float3 curlNoise(float3 p)
+{
+    const float e = 0.1;
+    float3 dx = float3(e, 0.0, 0.0);
+    float3 dy = float3(0.0, e, 0.0);
+    float3 dz = float3(0.0, 0.0, e);
+    float3 p_x0 = p - dx;
+    float3 p_x1 = p + dx;
+    float3 p_y0 = p - dy;
+    float3 p_y1 = p + dy;
+    float3 p_z0 = p - dz;
+    float3 p_z1 = p + dz;
+    float x = snoise(p_y1) - snoise(p_y0) - snoise(p_z1) + snoise(p_z0);
+    float y = snoise(p_z1) - snoise(p_z0) - snoise(p_x1) + snoise(p_x0);
+    float z = snoise(p_x1) - snoise(p_x0) - snoise(p_y1) + snoise(p_y0);
+    return normalize(float3(x, y, z));
+}
+
+// --- KERNELS ---
+
 [numthreads(1, 1, 1)]
 void UpdateArgs(uint3 id : SV_DispatchThreadID)
 {
@@ -59,92 +149,36 @@ void UpdateArgs(uint3 id : SV_DispatchThreadID)
     _IndirectArgs[1] = 0;
 }
 
-// =========================================================================
-// KERNEL 2: Emit
-// =========================================================================
 [numthreads(THREAD_COUNT_1D, 1, 1)]
 void Emit(uint3 id : SV_DispatchThreadID)
 {
     if (id.x >= _EmissionCount) return;
-
     uint dead_count;
     InterlockedAdd(_Counters[0], -1, dead_count);
-    
     if (dead_count < 1)
     {
-        // 如果没有可用粒子，把计数器加回来，防止无限递减
         InterlockedAdd(_Counters[0], 1);
         return;
     }
-    
-    // 【致命BUG修复】使用 dead_count - 1 作为索引，以正确读取池中最后一个有效元素。
     uint p_idx = _DeadPool[dead_count - 1];
-
+    Emitter emitter = _Emitters[_EmitterIndex];
     Particle p;
     p.lifetime = float4(0, lerp(_MinLifetime, _MaxLifetime, rand(id.xy + _Seeds.xy)), 0, 0);
-    
-    // 【修改】根据 _EmissionType 选择发射逻辑
-    if (_EmissionType == 0) // Random Mode
-    {
-        // 自由漂浮发射 - 从一个球体内随机发射
-        float3 randomOffset = float3(
-            (rand(id.xy + _Seeds.xy) - 0.5) * 2.0,
-            (rand(id.yx + _Seeds.yz) - 0.5) * 2.0,
-            (rand(id.xy + _Seeds.zx) - 0.5) * 2.0
-        );
-        p.position = float4(_EmitterPosition + normalize(randomOffset) * _EmitterRadius * rand(id.xy + _Seeds.yx), 0);
-        
-        float3 direction = _EmitterDirection.x == 0 && _EmitterDirection.y == 0 && _EmitterDirection.z == 0 ?
-                           normalize(randomOffset) :
-                           _EmitterDirection;
-        
-        float speed = lerp(_MinInitialSpeed, _MaxInitialSpeed, rand(id.yx + _Seeds.zy));
-        p.velocity = float4(direction * speed, 0);
-    }
-    else // Spiral Mode (Default)
-    {
-        float t = rand(id.xy + _Seeds.xy); // 随机参数t
-        
-        // 计算螺旋位置
-        float angle = t * _SpiralTurns * 2.0 * 3.14159;
-        float height = t * _SpiralHeight;
-        float radius = _SpiralRadius * (1.0 - t); // 半径随高度递减
-        
-        float3 spiralPos = float3(
-            cos(angle) * radius,
-            height,
-            sin(angle) * radius
-        );
-        p.position = float4(_EmitterPosition + spiralPos, 0);
-        
-        // 螺旋方向 - 切线方向
-        float3 spiralDirection = normalize(float3(
-            -sin(angle) * radius * _SpiralTurns * 2.0 * 3.14159 / _SpiralHeight,
-            1.0,
-            cos(angle) * radius * _SpiralTurns * 2.0 * 3.14159 / _SpiralHeight
-        ));
-        
-        float speed = lerp(_MinInitialSpeed, _MaxInitialSpeed, rand(id.yx + _Seeds.zy));
-        p.velocity = float4(spiralDirection * speed, 0);
-    }
-
-    float3 randomColor = float3(
-        rand(id.xy + _Seeds.xy),
-        rand(id.yx + _Seeds.yz),
-        rand(id.xy + _Seeds.zx)
-    );
-    p.color = float4(randomColor, 1.0);
-
+    float3 random_vec = float3(
+        rand(id.xy + _Seeds.xy * 0.3) - 0.5,
+        rand(id.yx + _Seeds.yz * 0.7) - 0.5,
+        rand(id.xy + _Seeds.zx * 0.1) - 0.5
+    ) * 2.0;
+    p.position = float4(emitter.position + normalize(random_vec) * emitter.radius * rand(id.yx + _Seeds.xz), 1.0);
+    float speed = lerp(emitter.minInitialSpeed, emitter.maxInitialSpeed, rand(id.yx + _Seeds.zy));
+    p.velocity = float4(emitter.initialVelocity + normalize(random_vec) * speed, 0);
+    p.color = emitter.color;
     _Particles[p_idx] = p;
-
     uint alive_insert_idx;
     InterlockedAdd(_Counters[_PingPong_A], 1, alive_insert_idx);
     _AliveIndices_A[alive_insert_idx] = p_idx;
 }
 
-// =========================================================================
-// KERNEL 3: Simulate
-// =========================================================================
 [numthreads(THREAD_COUNT_1D, 1, 1)]
 void Simulate(uint3 id : SV_DispatchThreadID)
 {
@@ -164,35 +198,48 @@ void Simulate(uint3 id : SV_DispatchThreadID)
     }
     else
     {
-        if (_AffectedByGravity > 0)
+        float3 acceleration = float3(0, 0, 0);
+        acceleration += _GlobalForce;
+        for (int i = 0; i < _ForceFieldCount; i++)
         {
-            p.velocity.y -= 9.81 * _DeltaTime;
+            ForceField ff = _ForceFields[i];
+            if (ff.enabled == 0) continue;
+            float3 dir = ff.position - p.position.xyz;
+            float dist = length(dir);
+            if (dist < ff.radius && dist > 0.001)
+            {
+                float falloff = 1.0 - (dist / ff.radius);
+                acceleration += normalize(dir) * ff.strength * falloff * falloff;
+            }
         }
         
-        // 【修改】只在螺旋模式下施加螺旋力
-        if (_EmissionType == 1)
+        if (_CurlNoiseEnabled)
         {
-            // 【修改】注释更新，更准确地描述行为
-            // 施加一个螺旋形的力场来引导粒子运动
-            float3 particlePos = p.position.xyz;
-            float currentAngle = atan2(particlePos.z, particlePos.x);
-            
-            // 【修改】使用 uniform 变量而不是硬编码的数字
-            float3 spiralForce3D = float3(
-                -sin(currentAngle) * _SpiralForce,
-                0.0,
-                cos(currentAngle) * _SpiralForce
-            );
-            
-            float time = p.lifetime.x;
-            float noiseX = sin(particlePos.x * 0.01 + time * 0.5) * 0.1;
-            float noiseY = sin(particlePos.y * 0.01 + time * 0.4) * 0.1;
-            float noiseZ = sin(particlePos.z * 0.01 + time * 0.7) * 0.1;
-            
-            p.velocity.xyz += (spiralForce3D + float3(noiseX, noiseY, noiseZ)) * _DeltaTime;
+            float3 curl = curlNoise(p.position.xyz * _CurlNoiseScale);
+            acceleration += curl * _CurlNoiseStrength;
         }
-        
+
+        p.velocity.xyz += acceleration * _DeltaTime;
+        p.velocity.xyz *= (1.0 - _Drag * _DeltaTime);
         p.position.xyz += p.velocity.xyz * _DeltaTime;
+        
+        float life_ratio = saturate((float)p.lifetime.x / (float)p.lifetime.y);
+        
+        // 速度到颜色映射
+        float speed = length(p.velocity.xyz);
+        float speedRatio = saturate(speed / _MaxSpeedForColor);
+        
+        // 创建从蓝色到红色的速度颜色映射
+        float3 velocityColor = lerp(float3(0, 0, 1), float3(1, 0, 0), speedRatio);
+        
+        // 根据设置选择颜色
+        if (_VelocityToColor) {
+            p.color.rgb = velocityColor;
+        } else {
+            p.color.rgb = lerp(p.color.rgb, float3(1,1,0), life_ratio * 0.5);
+        }
+        
+        p.color.a = 1.0 - life_ratio;
         
         _Particles[p_idx] = p;
         
