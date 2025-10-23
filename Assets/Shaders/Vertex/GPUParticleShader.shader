@@ -52,7 +52,7 @@ Shader "Unlit/GPUParticleShader"
                 float3 right = cross(viewer, up);
 
                 float lifeRatio = saturate(p.lifetime.x / p.lifetime.y);
-                float size = lerp(0.05, 0.01, lifeRatio); // 恢复原始粒子大小
+                float size = lerp(0.1, 0.05, lifeRatio); // 【修改】增加粒子大小，让它们更明显
                 float4 pos = float4(center + (v.vertex.x * right + v.vertex.y * up) * size, 1.0);
 
                 o.vertex = UnityObjectToClipPos(pos);

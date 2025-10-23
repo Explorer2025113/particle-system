@@ -3,10 +3,8 @@
 #pragma kernel Simulate
 #pragma target 5.0
 
-// 常量定义
-#define THREAD_COUNT_1D 256 // 可以根据需要调整，但要与 C# 匹配
+#define THREAD_COUNT_1D 256
 
-// 粒子结构体 (与 C# 的 Particle.cs 匹配)
 struct Particle
 {
     float4 lifetime; // x: current age, y: max lifetime
@@ -15,15 +13,15 @@ struct Particle
     float4 color;
 };
 
-// --- GPU 缓冲区 ---
+// --- GPU Buffers ---
 RWStructuredBuffer<Particle> _Particles;
 RWStructuredBuffer<uint> _DeadPool;
-RWStructuredBuffer<uint> _AliveIndices_A; // 输入的活粒子索引 (Ping)
-RWStructuredBuffer<uint> _AliveIndices_B; // 输出的活粒子索引 (Pong)
+RWStructuredBuffer<uint> _AliveIndices_A;
+RWStructuredBuffer<uint> _AliveIndices_B;
 RWStructuredBuffer<uint> _Counters;       // [0]=dead_count, [1]=alive_A_count, [2]=alive_B_count
-RWStructuredBuffer<uint> _IndirectArgs;   // 间接绘制参数
+RWStructuredBuffer<uint> _IndirectArgs;
 
-// --- 全局 Uniform 变量 ---
+// --- Uniforms ---
 float _DeltaTime;
 uint _PingPong_A;
 uint _PingPong_B;
@@ -33,34 +31,36 @@ float _MaxLifetime;
 float _MinInitialSpeed;
 float _MaxInitialSpeed;
 float3 _EmitterPosition;
-float3 _EmitterDirection;
+float3 _EmitterDirection; // 用于随机模式
 float _EmitterRadius;
-float3 _Seeds; // 随机数种子
+float3 _Seeds;
 uint _AffectedByGravity;
 
+// 【新增】用于控制逻辑的 Uniforms
+uint _EmissionType;   // 0 for Random, 1 for Spiral
+float _SpiralForce;   // 螺旋力强度
+float _SpiralRadius;
+float _SpiralHeight;
+float _SpiralTurns;
 
-// --- 简单的伪随机数函数 ---
+
 float rand(float2 co)
 {
     return frac(sin(dot(co, float2(12.9898, 78.233))) * 43758.5453);
 }
 
 // =========================================================================
-// KERNEL 1: UpdateArgs - 准备阶段
+// KERNEL 1: UpdateArgs
 // =========================================================================
 [numthreads(1, 1, 1)]
 void UpdateArgs(uint3 id : SV_DispatchThreadID)
 {
-    // 将上一帧 B 缓冲区的活粒子总数移动到 A 缓冲区，作为本帧模拟的输入
-    _Counters[_PingPong_A] = _Counters[_PingPong_B];
-    // 重置下一帧 (B) 的活粒子计数器
     _Counters[_PingPong_B] = 0;
-    // 重置间接绘制参数中的实例数量为 0
     _IndirectArgs[1] = 0;
 }
 
 // =========================================================================
-// KERNEL 2: Emit - 发射阶段
+// KERNEL 2: Emit
 // =========================================================================
 [numthreads(THREAD_COUNT_1D, 1, 1)]
 void Emit(uint3 id : SV_DispatchThreadID)
@@ -69,57 +69,65 @@ void Emit(uint3 id : SV_DispatchThreadID)
 
     uint dead_count;
     InterlockedAdd(_Counters[0], -1, dead_count);
-    if (dead_count <= 0) {
-        return; // 没有可用的死粒子，跳过发射
+    
+    if (dead_count < 1)
+    {
+        // 如果没有可用粒子，把计数器加回来，防止无限递减
+        InterlockedAdd(_Counters[0], 1);
+        return;
     }
-    uint p_idx = _DeadPool[dead_count];
+    
+    // 【致命BUG修复】使用 dead_count - 1 作为索引，以正确读取池中最后一个有效元素。
+    uint p_idx = _DeadPool[dead_count - 1];
 
     Particle p;
-    // 完全初始化粒子结构体
     p.lifetime = float4(0, lerp(_MinLifetime, _MaxLifetime, rand(id.xy + _Seeds.xy)), 0, 0);
     
-    // 使用螺旋位置而不是随机位置
-    p.position = float4(_EmitterPosition, 0); // 将在下面设置为螺旋位置
+    // 【修改】根据 _EmissionType 选择发射逻辑
+    if (_EmissionType == 0) // Random Mode
+    {
+        // 自由漂浮发射 - 从一个球体内随机发射
+        float3 randomOffset = float3(
+            (rand(id.xy + _Seeds.xy) - 0.5) * 2.0,
+            (rand(id.yx + _Seeds.yz) - 0.5) * 2.0,
+            (rand(id.xy + _Seeds.zx) - 0.5) * 2.0
+        );
+        p.position = float4(_EmitterPosition + normalize(randomOffset) * _EmitterRadius * rand(id.xy + _Seeds.yx), 0);
+        
+        float3 direction = _EmitterDirection.x == 0 && _EmitterDirection.y == 0 && _EmitterDirection.z == 0 ?
+                           normalize(randomOffset) :
+                           _EmitterDirection;
+        
+        float speed = lerp(_MinInitialSpeed, _MaxInitialSpeed, rand(id.yx + _Seeds.zy));
+        p.velocity = float4(direction * speed, 0);
+    }
+    else // Spiral Mode (Default)
+    {
+        float t = rand(id.xy + _Seeds.xy); // 随机参数t
+        
+        // 计算螺旋位置
+        float angle = t * _SpiralTurns * 2.0 * 3.14159;
+        float height = t * _SpiralHeight;
+        float radius = _SpiralRadius * (1.0 - t); // 半径随高度递减
+        
+        float3 spiralPos = float3(
+            cos(angle) * radius,
+            height,
+            sin(angle) * radius
+        );
+        p.position = float4(_EmitterPosition + spiralPos, 0);
+        
+        // 螺旋方向 - 切线方向
+        float3 spiralDirection = normalize(float3(
+            -sin(angle) * radius * _SpiralTurns * 2.0 * 3.14159 / _SpiralHeight,
+            1.0,
+            cos(angle) * radius * _SpiralTurns * 2.0 * 3.14159 / _SpiralHeight
+        ));
+        
+        float speed = lerp(_MinInitialSpeed, _MaxInitialSpeed, rand(id.yx + _Seeds.zy));
+        p.velocity = float4(spiralDirection * speed, 0);
+    }
 
-    // 自由漂浮发射 - 从中心点随机发射
-    float3 randomOffset = float3(
-        (rand(id.xy + _Seeds.xy) - 0.5) * 2.0,
-        (rand(id.yx + _Seeds.yz) - 0.5) * 2.0,
-        (rand(id.xy + _Seeds.zx) - 0.5) * 2.0
-    ) * _EmitterRadius;
-    
-    p.position = float4(_EmitterPosition + randomOffset, 0);
-    
-    // 螺旋形发射 - 使用螺旋参数
-    float t = rand(id.xy + _Seeds.xy); // 随机参数t
-    float spiralRadius = 2.0; // 螺旋半径
-    float spiralHeight = 5.0; // 螺旋高度
-    float spiralTurns = 3.0; // 螺旋圈数
-    
-    // 计算螺旋位置
-    float angle = t * spiralTurns * 2.0 * 3.14159;
-    float height = t * spiralHeight;
-    float radius = spiralRadius * (1.0 - t); // 半径随高度递减
-    
-    float3 spiralPos = float3(
-        cos(angle) * radius,
-        height,
-        sin(angle) * radius
-    );
-    
-    p.position = float4(_EmitterPosition + spiralPos, 0);
-    
-    // 螺旋方向 - 切线方向
-    float3 spiralDirection = normalize(float3(
-        -sin(angle) * radius * spiralTurns * 2.0 * 3.14159 / spiralHeight,
-        1.0,
-        cos(angle) * radius * spiralTurns * 2.0 * 3.14159 / spiralHeight
-    ));
-    
-    float speed = lerp(_MinInitialSpeed, _MaxInitialSpeed, rand(id.yx + _Seeds.zy));
-    p.velocity = float4(spiralDirection * speed, 0);
-    
-    // 随机颜色
     float3 randomColor = float3(
         rand(id.xy + _Seeds.xy),
         rand(id.yx + _Seeds.yz),
@@ -130,13 +138,12 @@ void Emit(uint3 id : SV_DispatchThreadID)
     _Particles[p_idx] = p;
 
     uint alive_insert_idx;
-    // D3D/Unity 不提供 InterlockedIncrement 重载，这里用加1的 InterlockedAdd 代替
     InterlockedAdd(_Counters[_PingPong_A], 1, alive_insert_idx);
     _AliveIndices_A[alive_insert_idx] = p_idx;
 }
 
 // =========================================================================
-// KERNEL 3: Simulate - 模拟阶段 (你之前的 ParticleSimulation kernel)
+// KERNEL 3: Simulate
 // =========================================================================
 [numthreads(THREAD_COUNT_1D, 1, 1)]
 void Simulate(uint3 id : SV_DispatchThreadID)
@@ -151,55 +158,48 @@ void Simulate(uint3 id : SV_DispatchThreadID)
 
     if (p.lifetime.x >= p.lifetime.y)
     {
-        // 粒子死亡，添加到死粒子池
         uint dead_insert_idx;
         InterlockedAdd(_Counters[0], 1, dead_insert_idx);
         _DeadPool[dead_insert_idx] = p_idx;
     }
     else
     {
-        // 粒子存活，更新物理
         if (_AffectedByGravity > 0)
         {
             p.velocity.y -= 9.81 * _DeltaTime;
         }
         
-        // 螺旋形运动 - 保持螺旋轨迹
-        float time = _DeltaTime * 1000.0; // 时间缩放
-        float3 particlePos = p.position.xyz;
+        // 【修改】只在螺旋模式下施加螺旋力
+        if (_EmissionType == 1)
+        {
+            // 【修改】注释更新，更准确地描述行为
+            // 施加一个螺旋形的力场来引导粒子运动
+            float3 particlePos = p.position.xyz;
+            float currentAngle = atan2(particlePos.z, particlePos.x);
+            
+            // 【修改】使用 uniform 变量而不是硬编码的数字
+            float3 spiralForce3D = float3(
+                -sin(currentAngle) * _SpiralForce,
+                0.0,
+                cos(currentAngle) * _SpiralForce
+            );
+            
+            float time = p.lifetime.x;
+            float noiseX = sin(particlePos.x * 0.01 + time * 0.5) * 0.1;
+            float noiseY = sin(particlePos.y * 0.01 + time * 0.4) * 0.1;
+            float noiseZ = sin(particlePos.z * 0.01 + time * 0.7) * 0.1;
+            
+            p.velocity.xyz += (spiralForce3D + float3(noiseX, noiseY, noiseZ)) * _DeltaTime;
+        }
         
-        // 计算当前粒子在螺旋中的角度
-        float currentAngle = atan2(particlePos.z, particlePos.x);
-        float currentRadius = length(particlePos.xz);
-        
-        // 螺旋力 - 让粒子继续沿着螺旋运动
-        float spiralForce = 0.1; // 螺旋力强度
-        float3 spiralForce3D = float3(
-            -sin(currentAngle) * spiralForce,
-            0.0, // 主要向上运动
-            cos(currentAngle) * spiralForce
-        );
-        
-        // 添加轻微的噪声让螺旋更自然
-        float noiseX = sin(particlePos.x * 0.01 + time * 0.05) * 0.1;
-        float noiseY = sin(particlePos.y * 0.01 + time * 0.04) * 0.1;
-        float noiseZ = sin(particlePos.z * 0.01 + time * 0.07) * 0.1;
-        
-        // 应用螺旋力和噪声
-        p.velocity.xyz += (spiralForce3D + float3(noiseX, noiseY, noiseZ)) * _DeltaTime;
-        
-        // 基础物理更新
         p.position.xyz += p.velocity.xyz * _DeltaTime;
         
-        // 重要：更新粒子数据到缓冲区
         _Particles[p_idx] = p;
         
-        // 将存活的粒子添加到下一帧的活粒子列表
         uint alive_insert_idx;
         InterlockedAdd(_Counters[_PingPong_B], 1, alive_insert_idx);
         _AliveIndices_B[alive_insert_idx] = p_idx;
 
-        // 更新间接绘制参数
         InterlockedAdd(_IndirectArgs[1], 1);
     }
 }
