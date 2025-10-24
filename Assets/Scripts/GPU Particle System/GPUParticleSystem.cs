@@ -1,155 +1,172 @@
-using UnityEngine;
-using System.Collections.Generic;
-using System.Linq;
+#pragma kernel UpdateArgs
+#pragma kernel Emit
+#pragma kernel Simulate
+#pragma target 5.0
 
-public class GPUParticleSystem : MonoBehaviour
+#define THREAD_COUNT_1D 256
+
+// --- Structs ---
+struct Particle { float4 lifetime; float4 velocity; float4 position; float4 color; };
+struct Emitter { float4 position; float4 initialVelocity; float4 speedMinMax; float4 color; float4 ratesAndEnabled; };
+struct ForceField { float4 positionAndRadius; float4 strengthAndEnabled; };
+
+// =================================================================
+//     DEBUGGING: 用于从GPU回读数据的结构体
+// =================================================================
+struct DebugData
 {
-    // Emitter, ForceField, EmitterGPU, ForceFieldGPU 结构体定义 (无变化)
-    [System.Serializable]
-    public struct Emitter { public string name; public bool enabled; public int emissionRate; public Vector3 position; public float radius; public Vector3 initialVelocity; public float minInitialSpeed; public float maxInitialSpeed; public Color color; }
-    [System.Serializable]
-    public struct ForceField { public string name; public bool enabled; public Vector3 position; public float radius; public float strength; }
-    private struct EmitterGPU { public int enabled; public int emissionRate; public Vector3 position; public float radius; public Vector3 initialVelocity; public float minInitialSpeed; public float maxInitialSpeed; public Color color; }
-    private struct ForceFieldGPU { public int enabled; public Vector3 position; public float radius; public float strength; }
+    uint particleId;
+    float3 inPosition;
+    float3 attractorPosition;
+    float attractorStrength;
+    float attractorEnabled;
+    float3 acceleration;
+    float3 outPosition;
+};
+// =================================================================
 
-    [Header("Emitters")]
-    public List<Emitter> emitters = new List<Emitter>();
 
-    [Header("Global Forces")]
-    public List<ForceField> forceFields = new List<ForceField>();
-    public Vector3 globalForce = Vector3.zero;
+// --- Buffers ---
+RWStructuredBuffer<Particle> _Particles;
+RWStructuredBuffer<uint> _DeadPool;
+RWStructuredBuffer<uint> _AliveIndices_A;
+RWStructuredBuffer<uint> _AliveIndices_B;
+RWStructuredBuffer<uint> _Counters;
+RWStructuredBuffer<uint> _IndirectArgs;
+StructuredBuffer<Emitter> _Emitters;
+StructuredBuffer<ForceField> _ForceFields;
+// =================================================================
+//     DEBUGGING: 声明调试缓冲区
+// =================================================================
+RWStructuredBuffer<DebugData> _DebugBuffer;
+// =================================================================
 
-    [Header("Curl Noise (Vortex) Settings")]
-    public bool curlNoiseEnabled = true;
-    public float curlNoiseScale = 1.0f;
-    public float curlNoiseStrength = 1.0f;
+// --- Uniforms ---
+float _DeltaTime;
+uint _PingPong_A;
+uint _PingPong_B;
+uint _EmissionCount;
+uint _EmitterIndex;
+float _MinLifetime;
+float _MaxLifetime;
+float _Drag;
+float3 _Seeds;
+float3 _GlobalForce;
+bool _CurlNoiseEnabled;
+float _CurlNoiseScale;
+float _CurlNoiseStrength;
+int _ForceFieldCount;
+bool _ColorOverLife;
+bool _VelocityToColor;
+float _MaxSpeedForColor;
 
-    [Header("Simulation Settings")]
-    public float minLifetime = 10.0f;
-    public float maxLifetime = 15.0f;
-    public float drag = 0.1f;
+// --- Utility Functions ---
+float rand(float2 co) { return frac(sin(dot(co, float2(12.9898, 78.233))) * 43758.5453); }
+float3 SafeNormalize(float3 v) { float l = length(v); if (l > 0.00001) { return v / l; } return float3(0, 1, 0); }
 
-    // 【新增】颜色控制
-    [Header("Color Settings")]
-    public bool colorOverLife = false; // 默认关闭，因为它会导致变黄
-    public bool velocityToColor = true; // 默认开启，以获得动态颜色
-    public float maxSpeedForColor = 20.0f; // 用于映射速度到颜色的最大速度值
+// --- Noise Functions ---
+float3 mod289(float3 x) { return x - floor(x * (1.0 / 289.0)) * 289.0; }
+float4 mod289(float4 x) { return x - floor(x * (1.0 / 289.0)) * 289.0; }
+float4 permute(float4 x) { return mod289(((x*34.0)+1.0)*x); }
+float4 taylorInvSqrt(float4 r) { return 1.79284291400159 - 0.85373472095314 * r; }
+float snoise(float3 v) { const float2 C = float2(1.0/6.0, 1.0/3.0) ; const float4 D = float4(0.0, 0.5, 1.0, 2.0); float3 i  = floor(v + dot(v, C.yyy) ); float3 x0 = v - i + dot(i, C.xxx) ; float3 g = step(x0.yzx, x0.xyz); float3 l = 1.0 - g; float3 i1 = min( g.xyz, l.zxy ); float3 i2 = max( g.xyz, l.zxy ); float3 x1 = x0 - i1 + C.xxx; float3 x2 = x0 - i2 + C.yyy; float3 x3 = x0 - D.yyy; i = mod289(i);  float4 p = permute( permute( permute( i.z + float4(0.0, i1.z, i2.z, 1.0 )) + i.y + float4(0.0, i1.y, i2.y, 1.0 )) + i.x + float4(0.0, i1.x, i2.x, 1.0 )); float n_ = 0.142857142857; float3 ns = n_ * D.wyz - D.xzx; float4 j = p - 49.0 * floor(p * ns.z * ns.z); float4 x_ = floor(j * ns.z); float4 y_ = floor(j - 7.0 * x_ ); float4 x = x_ * ns.x + ns.yyyy; float4 y = y_ * ns.x + ns.yyyy; float4 h = 1.0 - abs(x) - abs(y); float4 b0 = float4( x.xy, y.xy ); float4 b1 = float4( x.zw, y.zw ); float4 s0 = floor(b0)*2.0 + 1.0; float4 s1 = floor(b1)*2.0 + 1.0; float4 sh = -step(h, float4(0,0,0,0)); float4 a0 = b0.xzyw + s0.xzyw*sh.xxyy; float4 a1 = b1.xzyw + s1.xzyw*sh.zzww; float3 p0 = float3(a0.xy,h.x); float3 p1 = float3(a0.zw,h.y); float3 p2 = float3(a1.xy,h.z); float3 p3 = float3(a1.zw,h.w); float4 norm = taylorInvSqrt(float4(dot(p0,p0), dot(p1,p1), dot(p2, p2), dot(p3,p3))); p0 *= norm.x; p1 *= norm.y; p2 *= norm.z; p3 *= norm.w; float4 m = max(0.6 - float4(dot(x0,x0), dot(x1,x1), dot(x2,x2), dot(x3,x3)), 0.0); m = m * m; return 42.0 * dot( m*m, float4( dot(p0,x0), dot(p1,x1), dot(p2,x2), dot(p3,x3) ) ); }
+float3 curlNoise(float3 p) { const float e = 0.1; float3 dx = float3(e,0,0); float3 dy = float3(0,e,0); float3 dz = float3(0,0,e); float3 p_x0 = p-dx; float3 p_x1=p+dx; float3 p_y0=p-dy; float3 p_y1=p+dy; float3 p_z0=p-dz; float3 p_z1=p+dz; float x=snoise(p_y1)-snoise(p_y0)-snoise(p_z1)+snoise(p_z0); float y=snoise(p_z1)-snoise(p_z0)-snoise(p_x1)+snoise(p_x0); float z=snoise(p_x1)-snoise(p_x0)-snoise(p_y1)+snoise(p_y0); return SafeNormalize(float3(x,y,z)); }
 
-    [Header("General Settings")]
-    public bool prewarm = true;
-    public float prewarmTime = 10.0f;
-    public Vector3 renderBounds = new Vector3(200, 200, 200);
 
-    [Header("References")]
-    public ComputeShader computeShader;
-    public Material particleMaterial;
-    public Mesh particleMesh;
+// --- KERNELS ---
+[numthreads(1,1,1)] void UpdateArgs(uint3 id:SV_DispatchThreadID){ _Counters[_PingPong_B]=0; _IndirectArgs[1]=0; }
+[numthreads(THREAD_COUNT_1D,1,1)] void Emit(uint3 id:SV_DispatchThreadID){ if(id.x>=_EmissionCount)return; uint dead_count; InterlockedAdd(_Counters[0],-1,dead_count); if(dead_count<1){InterlockedAdd(_Counters[0],1); return;} uint p_idx=_DeadPool[dead_count-1]; Emitter emitter=_Emitters[_EmitterIndex]; Particle p; p.lifetime=float4(0,lerp(_MinLifetime,_MaxLifetime,rand(id.xy+_Seeds.xy)),0,0); float3 random_vec=float3(rand(id.xy+_Seeds.xy*0.3)-0.5,rand(id.yx+_Seeds.yz*0.7)-0.5,rand(id.xy+_Seeds.zx*0.1)-0.5)*2.0; float3 safe_random_dir=SafeNormalize(random_vec); float3 emitter_pos=emitter.position.xyz; float emitter_radius=emitter.position.w; float min_speed=emitter.speedMinMax.x; float max_speed=emitter.speedMinMax.y; float3 initial_vel=emitter.initialVelocity.xyz; p.position=float4(emitter_pos+safe_random_dir*emitter_radius*rand(id.yx+_Seeds.xz),1.0); float speed=lerp(min_speed,max_speed,rand(id.yx+_Seeds.zy)); p.velocity=float4(initial_vel+safe_random_dir*speed,0); p.color=emitter.color; _Particles[p_idx]=p; uint alive_insert_idx; InterlockedAdd(_Counters[_PingPong_A],1,alive_insert_idx); _AliveIndices_A[alive_insert_idx]=p_idx; }
 
-    // 私有变量 (无变化)
-    private int kernelUpdateArgs, kernelEmit, kernelSimulate;
-    private GraphicsBuffer particleBuffer, deadPoolBuffer, aliveIndicesBufferA, aliveIndicesBufferB, countersBuffer, indirectArgsBuffer;
-    private GraphicsBuffer emittersBuffer, forceFieldsBuffer;
-    private GraphicsBuffer[] aliveIndicesBuffers;
-    private int pingPongA = 1, pingPongB = 2;
-    private const int THREAD_COUNT_1D = 256;
+[numthreads(THREAD_COUNT_1D, 1, 1)]
+void Simulate(uint3 id : SV_DispatchThreadID)
+{
+    uint total_alive_count = _Counters[_PingPong_A];
+    if (id.x >= total_alive_count) return;
 
-    // OnEnable, OnDisable, Update, RunSimulationStep (无变化)
-    void OnEnable() { 
-        // 如果没有发射器，添加一个默认的
-        if (emitters.Count == 0) {
-            emitters.Add(new Emitter {
-                name = "Default Emitter",
-                enabled = true,
-                emissionRate = 50, // 进一步降低发射率
-                position = Vector3.zero,
-                radius = 2.0f, // 增大发射半径
-                initialVelocity = Vector3.up * 3.0f + Vector3.right * 1.0f, // 添加一些水平速度
-                minInitialSpeed = 2.0f,
-                maxInitialSpeed = 5.0f,
-                color = Color.cyan // 使用青色作为基础颜色
-            });
-        }
-        
-        // 禁用所有力场，避免粒子被吸引到中心
-        for (int i = 0; i < forceFields.Count; i++) {
-            var ff = forceFields[i];
-            ff.enabled = false;
-            forceFields[i] = ff;
-            Debug.Log($"🔧 禁用力场: {ff.name}");
-        }
-        
-        // 如果没有力场，添加一个禁用的默认力场
-        if (forceFields.Count == 0) {
-            forceFields.Add(new ForceField {
-                name = "Disabled Force Field",
-                enabled = false,
-                position = Vector3.zero,
-                radius = 10.0f,
-                strength = 0.0f
-            });
-            Debug.Log("🔧 添加了禁用的默认力场");
-        }
-        
-        InitializeBuffers(); 
-        InitializeParticles(); 
-        SetupCamera(); 
-        if (prewarm) { 
-            Debug.Log("🔥 Pre-warming particle system..."); 
-            float fixedDeltaTime = 1.0f / 30.0f; 
-            int prewarmSteps = Mathf.CeilToInt(prewarmTime / fixedDeltaTime); 
-            for (int i = 0; i < prewarmSteps; i++) { 
-                SetShaderParameters(); 
-                RunSimulationStep(fixedDeltaTime); 
-            } 
-            Debug.Log("🔥 Pre-warm complete."); 
-        } 
-    }
-    void OnDisable() { ReleaseBuffers(); }
-    void Update() { SetShaderParameters(); RunSimulationStep(Time.deltaTime); Bounds bounds = new Bounds(Vector3.zero, renderBounds); particleMaterial.SetBuffer("_Particles", particleBuffer); particleMaterial.SetBuffer("_AliveIndices", aliveIndicesBuffers[pingPongA - 1]); Graphics.DrawMeshInstancedIndirect(particleMesh, 0, particleMaterial, bounds, indirectArgsBuffer); if (Time.frameCount % 60 == 0) { uint[] finalCounters = new uint[3]; countersBuffer.GetData(finalCounters); Debug.Log($"🔥 GPU粒子系统运行中 - 活粒子: {finalCounters[pingPongA]}"); } }
-    private void RunSimulationStep(float deltaTime) { computeShader.SetBuffer(kernelEmit, "_Emitters", emittersBuffer); computeShader.SetBuffer(kernelSimulate, "_ForceFields", forceFieldsBuffer); computeShader.SetBuffer(kernelUpdateArgs, "_Counters", countersBuffer); computeShader.SetBuffer(kernelUpdateArgs, "_IndirectArgs", indirectArgsBuffer); computeShader.SetBuffer(kernelEmit, "_Particles", particleBuffer); computeShader.SetBuffer(kernelEmit, "_DeadPool", deadPoolBuffer); computeShader.SetBuffer(kernelEmit, "_Counters", countersBuffer); computeShader.SetBuffer(kernelSimulate, "_Particles", particleBuffer); computeShader.SetBuffer(kernelSimulate, "_DeadPool", deadPoolBuffer); computeShader.SetBuffer(kernelSimulate, "_Counters", countersBuffer); computeShader.SetBuffer(kernelSimulate, "_IndirectArgs", indirectArgsBuffer); computeShader.SetInt("_PingPong_A", pingPongA); computeShader.SetInt("_PingPong_B", pingPongB); computeShader.Dispatch(kernelUpdateArgs, 1, 1, 1); for (int i = 0; i < emitters.Count; i++) { if (!emitters[i].enabled) continue; int emissionCount = Mathf.RoundToInt(emitters[i].emissionRate * deltaTime); if (emissionCount > 0) { computeShader.SetInt("_EmitterIndex", i); computeShader.SetInt("_EmissionCount", emissionCount); computeShader.SetVector("_Seeds", new Vector3(Random.value, Random.value, Random.value)); computeShader.SetBuffer(kernelEmit, "_AliveIndices_A", aliveIndicesBuffers[pingPongA - 1]); computeShader.SetInt("_PingPong_A", pingPongA); int emitThreadGroups = Mathf.CeilToInt((float)emissionCount / THREAD_COUNT_1D); computeShader.Dispatch(kernelEmit, emitThreadGroups, 1, 1); } } uint[] currentCounters = new uint[3]; countersBuffer.GetData(currentCounters); uint simulationCount = currentCounters[pingPongA]; if (simulationCount > 0) { computeShader.SetBuffer(kernelSimulate, "_AliveIndices_A", aliveIndicesBuffers[pingPongA - 1]); computeShader.SetBuffer(kernelSimulate, "_AliveIndices_B", aliveIndicesBuffers[pingPongB - 1]); computeShader.SetFloat("_DeltaTime", deltaTime); computeShader.SetInt("_PingPong_A", pingPongA); computeShader.SetInt("_PingPong_B", pingPongB); int simulateThreadGroups = Mathf.CeilToInt((float)simulationCount / THREAD_COUNT_1D); computeShader.Dispatch(kernelSimulate, simulateThreadGroups, 1, 1); } int temp = pingPongA; pingPongA = pingPongB; pingPongB = temp; }
-    
-    private void SetShaderParameters()
+    uint p_idx = _AliveIndices_A[id.x];
+    Particle p = _Particles[p_idx];
+
+    // =================================================================
+    //     DEBUGGING: 捕获输入状态
+    // =================================================================
+    DebugData debug_data;
+    debug_data.particleId = p_idx;
+    debug_data.inPosition = p.position.xyz;
+    // =================================================================
+
+    p.lifetime.x += _DeltaTime;
+
+    if (p.lifetime.x >= p.lifetime.y)
     {
-        computeShader.SetFloat("_MinLifetime", minLifetime);
-        computeShader.SetFloat("_MaxLifetime", maxLifetime);
-        computeShader.SetFloat("_Drag", drag);
-        computeShader.SetVector("_GlobalForce", globalForce);
-        computeShader.SetBool("_CurlNoiseEnabled", curlNoiseEnabled);
-        computeShader.SetFloat("_CurlNoiseScale", curlNoiseScale);
-        computeShader.SetFloat("_CurlNoiseStrength", curlNoiseStrength);
+        uint dead_insert_idx;
+        InterlockedAdd(_Counters[0], 1, dead_insert_idx);
+        _DeadPool[dead_insert_idx] = p_idx;
+    }
+    else
+    {
+        float3 acceleration = _GlobalForce;
 
-        // 【新增】传递颜色控制参数
-        computeShader.SetBool("_ColorOverLife", colorOverLife);
-        computeShader.SetBool("_VelocityToColor", velocityToColor);
-        computeShader.SetFloat("_MaxSpeedForColor", maxSpeedForColor);
+        ForceField ff = _ForceFields[0]; // 假设我们只关心第一个力场
+        float ff_enabled = ff.strengthAndEnabled.y;
+        float3 ff_position = ff.positionAndRadius.xyz;
+        float ff_strength = ff.strengthAndEnabled.x;
 
-        if (emitters.Count > 0) { var gpuEmitters = emitters.Select(e => new EmitterGPU { enabled = e.enabled ? 1 : 0, emissionRate = e.emissionRate, position = e.position, radius = e.radius, initialVelocity = e.initialVelocity, minInitialSpeed = e.minInitialSpeed, maxInitialSpeed = e.maxInitialSpeed, color = e.color }).ToArray(); emittersBuffer.SetData(gpuEmitters); }
-        if (forceFields.Count > 0) { 
-            // 强制禁用所有力场
-            var gpuForceFields = forceFields.Select(f => new ForceFieldGPU { 
-                enabled = 0, // 强制设置为0，禁用所有力场
-                position = f.position, 
-                radius = f.radius, 
-                strength = 0.0f // 强制设置强度为0
-            }).ToArray(); 
-            forceFieldsBuffer.SetData(gpuForceFields); 
-            Debug.Log($"🔧 强制禁用所有力场，数量: {forceFields.Count}");
+        // =================================================================
+        //     DEBUGGING: 捕获力场状态
+        // =================================================================
+        debug_data.attractorPosition = ff_position;
+        debug_data.attractorStrength = ff_strength;
+        debug_data.attractorEnabled = ff_enabled;
+        // =================================================================
+
+        if (ff_enabled > 0.5)
+        {
+            float ff_radius = ff.positionAndRadius.w;
+            float3 dir = ff_position - p.position.xyz;
+            float dist = length(dir);
+            if (dist > 0.00001 && dist < ff_radius)
+            {
+                float falloff = 1.0 - (dist / ff_radius);
+                acceleration += (dir / dist) * ff_strength * falloff * falloff;
+            }
         }
-        computeShader.SetInt("_ForceFieldCount", forceFields.Count);
+        
+        if (_CurlNoiseEnabled)
+        {
+            float3 curl = curlNoise(p.position.xyz * _CurlNoiseScale);
+            acceleration += curl * _CurlNoiseStrength;
+        }
+
+        // =================================================================
+        //     DEBUGGING: 捕获加速度
+        // =================================================================
+        debug_data.acceleration = acceleration;
+        // =================================================================
+
+        p.velocity.xyz += acceleration * _DeltaTime;
+        p.velocity.xyz *= (1.0 - _Drag * _DeltaTime);
+        p.position.xyz += p.velocity.xyz * _DeltaTime;
+        
+        float life_ratio = saturate(p.lifetime.x / p.lifetime.y);
+        if (_VelocityToColor) { float speed=length(p.velocity.xyz); float speedRatio=saturate(speed/_MaxSpeedForColor); float3 velocityColor=lerp(float3(0,0,1),float3(1,0,0),speedRatio); p.color.rgb=velocityColor; }
+        else if (_ColorOverLife) { p.color.rgb = lerp(p.color.rgb, float3(1,1,0), life_ratio*0.5); }
+        p.color.a = 1.0 - life_ratio;
+        
+        _Particles[p_idx] = p;
+        
+        uint alive_insert_idx;
+        InterlockedAdd(_Counters[_PingPong_B], 1, alive_insert_idx);
+        _AliveIndices_B[alive_insert_idx] = p_idx;
+        InterlockedAdd(_IndirectArgs[1], 1);
+
+        // =================================================================
+        //     DEBUGGING: 捕获输出状态并写入缓冲区
+        // =================================================================
+        debug_data.outPosition = p.position.xyz;
+        if (id.x < 10) // 只写入前10个，防止缓冲区溢出
+        {
+            _DebugBuffer[id.x] = debug_data;
+        }
+        // =================================================================
     }
-    
-    // InitializeBuffers, InitializeParticles, SetupCamera, ReleaseBuffers (无变化)
-    void InitializeBuffers() { particleBuffer = new GraphicsBuffer(GraphicsBuffer.Target.Structured, ParticleConstants.MAX_PARTICLES, sizeof(float) * 16); deadPoolBuffer = new GraphicsBuffer(GraphicsBuffer.Target.Structured, ParticleConstants.MAX_PARTICLES, sizeof(uint)); aliveIndicesBufferA = new GraphicsBuffer(GraphicsBuffer.Target.Structured, ParticleConstants.MAX_PARTICLES, sizeof(uint)); aliveIndicesBufferB = new GraphicsBuffer(GraphicsBuffer.Target.Structured, ParticleConstants.MAX_PARTICLES, sizeof(uint)); aliveIndicesBuffers = new GraphicsBuffer[] { aliveIndicesBufferA, aliveIndicesBufferB }; countersBuffer = new GraphicsBuffer(GraphicsBuffer.Target.Structured, 3, sizeof(uint)); indirectArgsBuffer = new GraphicsBuffer(GraphicsBuffer.Target.IndirectArguments, 1, 5 * sizeof(uint)); emittersBuffer = new GraphicsBuffer(GraphicsBuffer.Target.Structured, Mathf.Max(1, emitters.Count), 60); forceFieldsBuffer = new GraphicsBuffer(GraphicsBuffer.Target.Structured, Mathf.Max(1, forceFields.Count), 24); }
-    void InitializeParticles() { kernelUpdateArgs = computeShader.FindKernel("UpdateArgs"); kernelEmit = computeShader.FindKernel("Emit"); kernelSimulate = computeShader.FindKernel("Simulate"); uint[] deadIndices = new uint[ParticleConstants.MAX_PARTICLES]; for (uint i = 0; i < ParticleConstants.MAX_PARTICLES; i++) { deadIndices[i] = i; } deadPoolBuffer.SetData(deadIndices); uint[] counters = new uint[] { (uint)ParticleConstants.MAX_PARTICLES, 0, 0 }; countersBuffer.SetData(counters); uint[] args = new uint[5] { 0, 0, 0, 0, 0 }; if (particleMesh != null) args[0] = particleMesh.GetIndexCount(0); indirectArgsBuffer.SetData(args); }
-    void SetupCamera() { 
-        if (Camera.main != null) { 
-            Camera.main.backgroundColor = Color.black; 
-            Camera.main.clearFlags = CameraClearFlags.SolidColor; 
-            Camera.main.transform.position = new Vector3(0, 5, -10); 
-            Camera.main.transform.rotation = Quaternion.identity; 
-            Camera.main.nearClipPlane = 0.1f;
-            Camera.main.farClipPlane = 1000f;
-        } 
-    }
-    void ReleaseBuffers() { particleBuffer?.Release(); deadPoolBuffer?.Release(); aliveIndicesBufferA?.Release(); aliveIndicesBufferB?.Release(); countersBuffer?.Release(); indirectArgsBuffer?.Release(); emittersBuffer?.Release(); forceFieldsBuffer?.Release(); }
 }
