@@ -191,6 +191,24 @@ void Emit(uint3 id : SV_DispatchThreadID)
     uint alive_insert_idx; 
     InterlockedAdd(_Counters[_PingPong_A], 1, alive_insert_idx); 
     _AliveIndices_A[alive_insert_idx] = p_idx; 
+
+    // =================================================================
+    //     DEBUGGING: 记录刚创建的粒子的位置到调试缓冲区
+    // =================================================================
+    if (id.x < 10) // 只记录前10个，防止缓冲区溢出
+    {
+        DebugData debug_data;
+        debug_data.particleId = p.globalId;
+        debug_data.emitterId = p.attributes.x;
+        debug_data.inPosition = p.position.xyz;
+        debug_data.attractorPosition = float3(0, 0, 0);
+        debug_data.attractorStrength = 0;
+        debug_data.attractorEnabled = 0;
+        debug_data.acceleration = float3(0, 0, 0);
+        debug_data.outPosition = p.position.xyz;  // 发射时的位置作为初始输出位置
+        _DebugBuffer[id.x] = debug_data;
+    }
+    // =================================================================
 }
 [numthreads(THREAD_COUNT_1D, 1, 1)]
 void Simulate(uint3 id : SV_DispatchThreadID)

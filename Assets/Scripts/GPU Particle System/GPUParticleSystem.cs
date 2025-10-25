@@ -55,9 +55,9 @@ public class GPUParticleSystem : MonoBehaviour
     public bool colorOverLife = false;
     public bool velocityToColor = false;
     public float maxSpeedForColor = 20.0f;
-    [Header("General Settings")]
-    public bool prewarm = true;
-    public float prewarmTime = 10.0f;
+         [Header("General Settings")]
+     public bool prewarm = false;  // 临时禁用prewarm以便调试初始位置
+     public float prewarmTime = 10.0f;
     public Vector3 renderBounds = new Vector3(100, 100, 100);
     [Header("References")]
     public ComputeShader computeShader;
@@ -106,10 +106,27 @@ void Update()
     // =================================================================================
     //     DEBUGGING: 在特定帧读取并打印GPU调试数据 (已更新)
     // =================================================================================
-    if (Time.frameCount == 60)
+    if (Time.frameCount == 1 || Time.frameCount == 60)
     {
+        int currentFrame = Time.frameCount;
+        
+        // 打印相机信息
+        if (Camera.main != null)
+        {
+            Debug.Log($"📷 Camera at Frame {currentFrame}: Pos={Camera.main.transform.position}, Rot={Camera.main.transform.rotation.eulerAngles}");
+        }
+        
+        // 打印发射器中心位置，用于对比
+        Debug.Log($"--- Frame {currentFrame} Emitter Data ({System.DateTime.Now:HH:mm:ss.fff}) ---");
+        for (int i = 0; i < emitters.Count; i++)
+        {
+            var e = emitters[i];
+            Debug.Log($"  Emitter {i}: name={e.name}, pos=({e.position.x:F2}, {e.position.y:F2}, {e.position.z:F2}), radius={e.radius}");
+        }
+        Debug.Log($"--- End Frame {currentFrame} Emitter Data ---");
+        
         _debugBuffer.GetData(_debugDataArray);
-        Debug.LogWarning("--- GPU DEBUG PROBE (Frame 60) ---");
+        Debug.LogWarning($"--- GPU DEBUG PROBE (Frame {currentFrame}) ---");
         for (int i = 0; i < DEBUG_COUNT; i++)
         {
             var data = _debugDataArray[i];
@@ -137,7 +154,7 @@ void Update()
                          $"  - Out Position:      {data.outPosition}";
             Debug.Log(log);
         }
-        Debug.LogWarning("--- END GPU DEBUG PROBE ---");
+        Debug.LogWarning($"--- END GPU DEBUG PROBE (Frame {currentFrame}) ---");
         
         // 将调试信息写入文件
         WriteDebugInfoToFile();
@@ -158,7 +175,24 @@ void Update()
         computeShader.SetBool("_VelocityToColor", velocityToColor);
         computeShader.SetFloat("_MaxSpeedForColor", maxSpeedForColor);
 
-        if (emitters.Count > 0) { var gpuEmitters = emitters.Select(e => new EmitterGPU { position = new Vector4(e.position.x, e.position.y, e.position.z, e.radius), initialVelocity = e.initialVelocity, speedMinMax = new Vector4(e.minInitialSpeed, e.maxInitialSpeed, 0, 0), color = e.color, ratesAndEnabled = new Vector4(e.emissionRate, e.enabled ? 1.0f : 0.0f, 0, 0) }).ToArray(); emittersBuffer.SetData(gpuEmitters); }
+        if (emitters.Count > 0) { var gpuEmitters = emitters.Select(e => new EmitterGPU { position = new Vector4(e.position.x, e.position.y, e.position.z, e.radius), initialVelocity = e.initialVelocity, speedMinMax = new Vector4(e.minInitialSpeed, e.maxInitialSpeed, 0, 0), color = e.color, ratesAndEnabled = new Vector4(e.emissionRate, e.enabled ? 1.0f : 0.0f, 0, 0) }).ToArray(); emittersBuffer.SetData(gpuEmitters); 
+            // 打印发射器数据用于调试
+            if (Time.frameCount == 1 || Time.frameCount == 60)  // 添加第1帧的调试
+            {
+                Debug.Log($"🔍 C#端发射器数据:");
+                for (int i = 0; i < emitters.Count; i++)
+                {
+                    var e = emitters[i];
+                    Debug.Log($"  Emitter {i}: name={e.name}, pos=({e.position.x:F2}, {e.position.y:F2}, {e.position.z:F2}), radius={e.radius}");
+                }
+                Debug.Log($"🔍 GPU端发射器数据:");
+                for (int i = 0; i < gpuEmitters.Length; i++)
+                {
+                    var e = gpuEmitters[i];
+                    Debug.Log($"  GPU Emitter {i}: pos=({e.position.x:F2}, {e.position.y:F2}, {e.position.z:F2}, {e.position.w:F2}), radius={e.position.w}");
+                }
+            }
+        }
         if (forceFields.Count > 0) { var gpuForceFields = forceFields.Select(f => new ForceFieldGPU { positionAndRadius = new Vector4(f.position.x, f.position.y, f.position.z, f.radius), strengthAndEnabled = new Vector4(f.strength, f.enabled ? 1.0f : 0.0f, 0, 0) }).ToArray(); forceFieldsBuffer.SetData(gpuForceFields); }
         computeShader.SetInt("_ForceFieldCount", forceFields.Count);
     }
@@ -184,6 +218,7 @@ void Update()
         //     DEBUGGING: 将调试缓冲区绑定到内核
         // =================================================================================
         computeShader.SetBuffer(kernelSimulate, "_DebugBuffer", _debugBuffer);
+        computeShader.SetBuffer(kernelEmit, "_DebugBuffer", _debugBuffer);
         // =================================================================================
         
         computeShader.Dispatch(kernelUpdateArgs, 1, 1, 1); 
@@ -319,6 +354,24 @@ void Update()
         {
             string logContent = $"\n--- Frame {Time.frameCount} Debug Info ({System.DateTime.Now:HH:mm:ss.fff}) ---\n";
             
+            // 添加相机信息
+            if (Camera.main != null)
+            {
+                logContent += $"Camera Position: {Camera.main.transform.position}\n";
+                logContent += $"Camera Rotation: {Camera.main.transform.rotation.eulerAngles}\n\n";
+            }
+            
+            // 添加发射器信息
+            logContent += $"--- Emitter Configuration ---\n";
+            for (int i = 0; i < emitters.Count; i++)
+            {
+                var e = emitters[i];
+                logContent += $"  Emitter {i}: name={e.name}, pos=({e.position.x:F2}, {e.position.y:F2}, {e.position.z:F2}), radius={e.radius}\n";
+            }
+            logContent += "\n";
+            
+            // 添加粒子调试数据
+            logContent += $"--- Particle Debug Data (First {DEBUG_COUNT} particles) ---\n";
             for (int i = 0; i < DEBUG_COUNT; i++)
             {
                 var data = _debugDataArray[i];
@@ -327,17 +380,9 @@ void Update()
                 string emitterName = "Unknown Emitter";
                 int emitterIndex = Mathf.RoundToInt(data.emitterId);
                 
-                // 调试信息：显示emitterId的原始值和转换后的索引
-                Debug.Log($"🔍 File Write - Particle {i}: emitterId={data.emitterId}, emitterIndex={emitterIndex}, emitters.Count={emitters.Count}");
-                
                 if (emitterIndex >= 0 && emitterIndex < emitters.Count)
                 {
                     emitterName = emitters[emitterIndex].name;
-                    Debug.Log($"✅ File Write - Found emitter: {emitterName} at index {emitterIndex}");
-                }
-                else
-                {
-                    Debug.LogWarning($"❌ File Write - Invalid emitter index: {emitterIndex} (emitterId={data.emitterId})");
                 }
                 
                 logContent += $"[{emitterName} | Particle {i}] Global ID: {data.particleId} (Index: {i})\n" +
@@ -347,8 +392,11 @@ void Update()
                              $"  - Out Position:      {data.outPosition}\n\n";
             }
             
+            logContent += $"\n{new string('=', 50)}\n\n";
+            
             // 追加到文件
             System.IO.File.AppendAllText(_debugLogPath, logContent);
+            Debug.Log($"📝 Debug info written to file: {_debugLogPath}");
         }
         catch (System.Exception e)
         {
