@@ -1,4 +1,5 @@
 using UnityEngine;
+using UnityEngine.Rendering.Universal;
 using System.Collections.Generic;
 using System.Linq;
 using System.Runtime.InteropServices;
@@ -17,26 +18,8 @@ public class GPUParticleSystem : MonoBehaviour
     [StructLayout(LayoutKind.Sequential)]
     private struct ForceFieldGPU { public Vector4 positionAndRadius; public Vector4 strengthAndEnabled; }
 
-    // =================================================================================
-    //     DEBUGGING: 用于从GPU回读数据的结构体
-    // =================================================================================
-    [StructLayout(LayoutKind.Sequential)]
-    private struct DebugData
-    {
-        public uint particleId;
-        public float emitterId; // 与GPU端字段顺序一致
-        public Vector3 inPosition;
-        public Vector3 attractorPosition;
-        public float attractorStrength;
-        public float attractorEnabled;
-        public Vector3 acceleration;
-        public Vector3 outPosition;
-    }
-    private GraphicsBuffer _debugBuffer;
-    private DebugData[] _debugDataArray;
-    private const int DEBUG_COUNT = 10;
-    private string _debugLogPath;
-    // =================================================================================
+    // （调试系统已移除）
+    private int _lastVisiblePingPong = 1; // 与渲染一致的可见Alive列表
 
     [Header("Emitters")]
     public List<Emitter> emitters = new List<Emitter>();
@@ -46,23 +29,50 @@ public class GPUParticleSystem : MonoBehaviour
     [Header("Curl Noise (Vortex) Settings")]
     public bool curlNoiseEnabled = true;
     public float curlNoiseScale = 0.05f;
-    public float curlNoiseStrength = 5.0f;
+    public float curlNoiseStrength = 3.0f; // 柔和一些
+    
     [Header("Simulation Settings")]
-    public float minLifetime = 8.0f;
-    public float maxLifetime = 12.0f;
-    public float drag = 0.1f;
+    public float minLifetime = 5.0f;
+    public float maxLifetime = 8.0f;
+    public float drag = 0.2f;
     [Header("Color Settings")]
-    public bool colorOverLife = false;
-    public bool velocityToColor = false;
+    public bool colorOverLife = false; // 关闭颜色统一化，保留发射器原色
+    public bool velocityToColor = true; // 启用速度着色
     public float maxSpeedForColor = 20.0f;
-         [Header("General Settings")]
-     public bool prewarm = false;  // 临时禁用prewarm以便调试初始位置
+        [Header("General Settings")]
+     public bool prewarm = true;   // 启用预热，启动即有粒子
      public float prewarmTime = 10.0f;
     public Vector3 renderBounds = new Vector3(100, 100, 100);
     [Header("References")]
     public ComputeShader computeShader;
     public Material particleMaterial;
     public Mesh particleMesh;
+    [Header("Curves (1D Textures)")]
+    public Texture2D colorOverLifeTex;
+    public Texture2D sizeOverLifeTex;
+
+    [Header("Camera Overrides (Runtime)")]
+    public bool forceBlackBackground = true;
+    public Color backgroundColor = Color.black;
+    public bool disablePostProcessing = true;
+
+    [Header("Ring Orbit Mode")]
+    public bool ringOrbitEnabled = false;
+    public Vector3 ringCenter = Vector3.zero;
+    public Vector3 ringAxis = Vector3.up;
+    public float ringRadius = 20f;
+    public float ringThickness = 4f;
+    public float ringGravity = 50f; // 近似万有引力常数（越大越紧密）
+    public float ringPlaneDamping = 2.0f; // 拉回到环平面的强度
+    public float orbitSpeedScale = 1.0f; // 速度缩放（>1 更快）
+
+    [Header("Flow Ribbon (Nebula) Mode")]
+    public bool flowRibbonEnabled = false;
+    public Vector3 flowDirection = new Vector3(1, 0, 0);
+    public float flowNoiseScale = 0.03f;
+    public float flowNoiseStrength = 3.0f;
+    public float flowConfinement = 0.0f; // 预留，可用于带状约束
+    public float flowDragBoost = 0.0f;   // 预留，可额外增加阻尼
 
     private int kernelUpdateArgs, kernelEmit, kernelSimulate;
     private GraphicsBuffer particleBuffer, deadPoolBuffer, aliveIndicesBufferA, aliveIndicesBufferB, countersBuffer, indirectArgsBuffer;
@@ -77,10 +87,8 @@ public class GPUParticleSystem : MonoBehaviour
         InitializeBuffers(); 
         InitializeParticles(); 
         SetupCamera(); 
-        SetupDebugLogging();
         if (prewarm) 
         { 
-            Debug.Log("🔥 Pre-warming..."); 
             float fixedDeltaTime = 1.0f / 30.0f; 
             int prewarmSteps = Mathf.CeilToInt(prewarmTime / fixedDeltaTime); 
             for (int i = 0; i < prewarmSteps; i++) 
@@ -88,7 +96,6 @@ public class GPUParticleSystem : MonoBehaviour
                 SetShaderParameters(); 
                 RunSimulationStep(fixedDeltaTime); 
             } 
-            Debug.Log("🔥 Pre-warm complete."); 
         } 
     }
     void OnDisable() { ReleaseBuffers(); }
@@ -96,70 +103,21 @@ public class GPUParticleSystem : MonoBehaviour
 void Update() 
 { 
     SetShaderParameters(); 
-    RunSimulationStep(Time.deltaTime); 
+    
+    var didSimulate = RunSimulationStep(Time.deltaTime);
+    
     
     Bounds bounds = new Bounds(Vector3.zero, renderBounds); 
     particleMaterial.SetBuffer("_Particles", particleBuffer); 
-    particleMaterial.SetBuffer("_AliveIndices", aliveIndicesBuffers[pingPongA - 1]); 
-    Graphics.DrawMeshInstancedIndirect(particleMesh, 0, particleMaterial, bounds, indirectArgsBuffer); 
+    // 渲染使用与当前可见列表一致的 alive 索引：
+    // 若本帧执行了 Simulate，则可见列表已在 B；否则仍在 A
+    var visiblePingPong = didSimulate ? pingPongB : pingPongA;
+    _lastVisiblePingPong = visiblePingPong;
+    particleMaterial.SetBuffer("_AliveIndices", aliveIndicesBuffers[visiblePingPong - 1]); 
     
-    // =================================================================================
-    //     DEBUGGING: 在特定帧读取并打印GPU调试数据 (已更新)
-    // =================================================================================
-    if (Time.frameCount == 1 || Time.frameCount == 60)
-    {
-        int currentFrame = Time.frameCount;
-        
-        // 打印相机信息
-        if (Camera.main != null)
-        {
-            Debug.Log($"📷 Camera at Frame {currentFrame}: Pos={Camera.main.transform.position}, Rot={Camera.main.transform.rotation.eulerAngles}");
-        }
-        
-        // 打印发射器中心位置，用于对比
-        Debug.Log($"--- Frame {currentFrame} Emitter Data ({System.DateTime.Now:HH:mm:ss.fff}) ---");
-        for (int i = 0; i < emitters.Count; i++)
-        {
-            var e = emitters[i];
-            Debug.Log($"  Emitter {i}: name={e.name}, pos=({e.position.x:F2}, {e.position.y:F2}, {e.position.z:F2}), radius={e.radius}");
-        }
-        Debug.Log($"--- End Frame {currentFrame} Emitter Data ---");
-        
-        _debugBuffer.GetData(_debugDataArray);
-        Debug.LogWarning($"--- GPU DEBUG PROBE (Frame {currentFrame}) ---");
-        for (int i = 0; i < DEBUG_COUNT; i++)
-        {
-            var data = _debugDataArray[i];
-            // 使用 emitterId 获取发射器名称
-            string emitterName = "Unknown Emitter";
-            int emitterIndex = Mathf.RoundToInt(data.emitterId);
-            
-            // 调试信息：显示emitterId的原始值和转换后的索引
-            Debug.Log($"🔍 Particle {i}: emitterId={data.emitterId}, emitterIndex={emitterIndex}, emitters.Count={emitters.Count}");
-            
-            if (emitterIndex >= 0 && emitterIndex < emitters.Count)
-            {
-                emitterName = emitters[emitterIndex].name;
-                Debug.Log($"✅ Found emitter: {emitterName} at index {emitterIndex}");
-            }
-            else
-            {
-                Debug.LogWarning($"❌ Invalid emitter index: {emitterIndex} (emitterId={data.emitterId})");
-            }
-
-            string log = $"[{emitterName} | Particle {i}] Global ID: {data.particleId} (Index: {i})\n" +
-                         $"  - In Position:       {data.inPosition}\n" +
-                         $"  - Attractor State:   Pos={data.attractorPosition}, Str={data.attractorStrength}, Enabled={data.attractorEnabled}\n" +
-                         $"  - Acceleration:      {data.acceleration}\n" +
-                         $"  - Out Position:      {data.outPosition}";
-            Debug.Log(log);
-        }
-        Debug.LogWarning($"--- END GPU DEBUG PROBE (Frame {currentFrame}) ---");
-        
-        // 将调试信息写入文件
-        WriteDebugInfoToFile();
-    }
-    // =================================================================================
+    if (colorOverLifeTex) particleMaterial.SetTexture("_ColorOverLifeTex", colorOverLifeTex);
+    if (sizeOverLifeTex)  particleMaterial.SetTexture("_SizeOverLifeTex", sizeOverLifeTex);
+    Graphics.DrawMeshInstancedIndirect(particleMesh, 0, particleMaterial, bounds, indirectArgsBuffer); 
     }
     
     void SetShaderParameters()
@@ -171,33 +129,35 @@ void Update()
         computeShader.SetBool("_CurlNoiseEnabled", curlNoiseEnabled);
         computeShader.SetFloat("_CurlNoiseScale", curlNoiseScale);
         computeShader.SetFloat("_CurlNoiseStrength", curlNoiseStrength);
+        // 已还原：不再下发 OpenGL 对齐的粘性/重力/常量速度参数
         computeShader.SetBool("_ColorOverLife", colorOverLife);
         computeShader.SetBool("_VelocityToColor", velocityToColor);
         computeShader.SetFloat("_MaxSpeedForColor", maxSpeedForColor);
 
-        if (emitters.Count > 0) { var gpuEmitters = emitters.Select(e => new EmitterGPU { position = new Vector4(e.position.x, e.position.y, e.position.z, e.radius), initialVelocity = e.initialVelocity, speedMinMax = new Vector4(e.minInitialSpeed, e.maxInitialSpeed, 0, 0), color = e.color, ratesAndEnabled = new Vector4(e.emissionRate, e.enabled ? 1.0f : 0.0f, 0, 0) }).ToArray(); emittersBuffer.SetData(gpuEmitters); 
-            // 打印发射器数据用于调试
-            if (Time.frameCount == 1 || Time.frameCount == 60)  // 添加第1帧的调试
-            {
-                Debug.Log($"🔍 C#端发射器数据:");
-                for (int i = 0; i < emitters.Count; i++)
-                {
-                    var e = emitters[i];
-                    Debug.Log($"  Emitter {i}: name={e.name}, pos=({e.position.x:F2}, {e.position.y:F2}, {e.position.z:F2}), radius={e.radius}");
-                }
-                Debug.Log($"🔍 GPU端发射器数据:");
-                for (int i = 0; i < gpuEmitters.Length; i++)
-                {
-                    var e = gpuEmitters[i];
-                    Debug.Log($"  GPU Emitter {i}: pos=({e.position.x:F2}, {e.position.y:F2}, {e.position.z:F2}, {e.position.w:F2}), radius={e.position.w}");
-                }
-            }
-        }
+        // Ring Orbit uniforms
+        computeShader.SetBool("_RingOrbitEnabled", ringOrbitEnabled);
+        computeShader.SetVector("_RingCenter", ringCenter);
+        computeShader.SetVector("_RingAxis", ringAxis);
+        computeShader.SetFloat("_RingRadius", ringRadius);
+        computeShader.SetFloat("_RingThickness", ringThickness);
+        computeShader.SetFloat("_RingGravity", ringGravity);
+        computeShader.SetFloat("_RingPlaneDamping", ringPlaneDamping);
+        computeShader.SetFloat("_OrbitSpeedScale", orbitSpeedScale);
+
+        // Flow Ribbon uniforms
+        computeShader.SetBool("_FlowRibbonEnabled", flowRibbonEnabled);
+        computeShader.SetVector("_FlowDirection", flowDirection);
+        computeShader.SetFloat("_FlowNoiseScale", flowNoiseScale);
+        computeShader.SetFloat("_FlowNoiseStrength", flowNoiseStrength);
+        computeShader.SetFloat("_FlowConfinement", flowConfinement);
+        computeShader.SetFloat("_FlowDragBoost", flowDragBoost);
+
+        if (emitters.Count > 0) { var gpuEmitters = emitters.Select(e => new EmitterGPU { position = new Vector4(e.position.x, e.position.y, e.position.z, e.radius), initialVelocity = e.initialVelocity, speedMinMax = new Vector4(e.minInitialSpeed, e.maxInitialSpeed, 0, 0), color = e.color, ratesAndEnabled = new Vector4(e.emissionRate, e.enabled ? 1.0f : 0.0f, 0, 0) }).ToArray(); emittersBuffer.SetData(gpuEmitters); }
         if (forceFields.Count > 0) { var gpuForceFields = forceFields.Select(f => new ForceFieldGPU { positionAndRadius = new Vector4(f.position.x, f.position.y, f.position.z, f.radius), strengthAndEnabled = new Vector4(f.strength, f.enabled ? 1.0f : 0.0f, 0, 0) }).ToArray(); forceFieldsBuffer.SetData(gpuForceFields); }
         computeShader.SetInt("_ForceFieldCount", forceFields.Count);
     }
     
-    void RunSimulationStep(float deltaTime) 
+    bool RunSimulationStep(float deltaTime) 
     { 
         computeShader.SetBuffer(kernelEmit, "_Emitters", emittersBuffer); 
         computeShader.SetBuffer(kernelSimulate, "_ForceFields", forceFieldsBuffer); 
@@ -214,18 +174,55 @@ void Update()
         computeShader.SetInt("_PingPong_A", pingPongA); 
         computeShader.SetInt("_PingPong_B", pingPongB); 
 
-        // =================================================================================
-        //     DEBUGGING: 将调试缓冲区绑定到内核
-        // =================================================================================
-        computeShader.SetBuffer(kernelSimulate, "_DebugBuffer", _debugBuffer);
-        computeShader.SetBuffer(kernelEmit, "_DebugBuffer", _debugBuffer);
-        // =================================================================================
-        
         computeShader.Dispatch(kernelUpdateArgs, 1, 1, 1); 
+        
+        // （调试索引重置已移除）
+        
+        // =================================================================================
+        //     【核心修改】先执行所有Emit，确保初始位置被记录
+        // =================================================================================
+        for (int i = 0; i < emitters.Count; i++) 
+        { 
+            if (!emitters[i].enabled) continue; 
+            int emissionCount = Mathf.RoundToInt(emitters[i].emissionRate * deltaTime); 
+            if (emissionCount > 0) 
+            { 
+                computeShader.SetInt("_EmitterIndex", i); 
+                computeShader.SetInt("_EmissionCount", emissionCount); 
+                computeShader.SetVector("_Seeds", new Vector3(Random.value, Random.value, Random.value)); 
+                computeShader.SetBuffer(kernelEmit, "_AliveIndices_A", aliveIndicesBuffers[pingPongA - 1]); 
+                computeShader.SetInt("_PingPong_A", pingPongA); 
+                int emitThreadGroups = Mathf.CeilToInt((float)emissionCount / THREAD_COUNT_1D); 
+                computeShader.Dispatch(kernelEmit, emitThreadGroups, 1, 1); 
+            } 
+        } 
+        
+        // 读取当前计数
+        uint[] currentCounters = new uint[3]; 
+        countersBuffer.GetData(currentCounters); 
+        uint simulationCount = currentCounters[pingPongA]; 
+        bool simulateExecuted = false;
+        
+        // 有粒子即执行模拟（删除首帧特殊路径）
+        if (simulationCount > 0) 
+        { 
+            computeShader.SetBuffer(kernelSimulate, "_AliveIndices_A", aliveIndicesBuffers[pingPongA - 1]); 
+            computeShader.SetBuffer(kernelSimulate, "_AliveIndices_B", aliveIndicesBuffers[pingPongB - 1]); 
+            computeShader.SetFloat("_DeltaTime", deltaTime); 
+            computeShader.SetInt("_PingPong_A", pingPongA); 
+            computeShader.SetInt("_PingPong_B", pingPongB); 
+            int simulateThreadGroups = Mathf.CeilToInt((float)simulationCount / THREAD_COUNT_1D); 
+            computeShader.Dispatch(kernelSimulate, simulateThreadGroups, 1, 1); 
+            simulateExecuted = true;
+        } 
+        if (simulateExecuted)
+        {
+            int temp = pingPongA; 
+            pingPongA = pingPongB; 
+            pingPongB = temp; 
+        }
 
-        for (int i = 0; i < emitters.Count; i++) { if (!emitters[i].enabled) continue; int emissionCount = Mathf.RoundToInt(emitters[i].emissionRate * deltaTime); if (emissionCount > 0) { computeShader.SetInt("_EmitterIndex", i); computeShader.SetInt("_EmissionCount", emissionCount); computeShader.SetVector("_Seeds", new Vector3(Random.value, Random.value, Random.value)); computeShader.SetBuffer(kernelEmit, "_AliveIndices_A", aliveIndicesBuffers[pingPongA - 1]); computeShader.SetInt("_PingPong_A", pingPongA); int emitThreadGroups = Mathf.CeilToInt((float)emissionCount / THREAD_COUNT_1D); computeShader.Dispatch(kernelEmit, emitThreadGroups, 1, 1); } } 
-        uint[] currentCounters = new uint[3]; countersBuffer.GetData(currentCounters); uint simulationCount = currentCounters[pingPongA]; if (simulationCount > 0) { computeShader.SetBuffer(kernelSimulate, "_AliveIndices_A", aliveIndicesBuffers[pingPongA - 1]); computeShader.SetBuffer(kernelSimulate, "_AliveIndices_B", aliveIndicesBuffers[pingPongB - 1]); computeShader.SetFloat("_DeltaTime", deltaTime); computeShader.SetInt("_PingPong_A", pingPongA); computeShader.SetInt("_PingPong_B", pingPongB); int simulateThreadGroups = Mathf.CeilToInt((float)simulationCount / THREAD_COUNT_1D); computeShader.Dispatch(kernelSimulate, simulateThreadGroups, 1, 1); } 
-        int temp = pingPongA; pingPongA = pingPongB; pingPongB = temp; 
+        return simulateExecuted;
     }
     
     void InitializeBuffers() 
@@ -237,31 +234,11 @@ void Update()
         aliveIndicesBuffers = new GraphicsBuffer[] { aliveIndicesBufferA, aliveIndicesBufferB }; 
         countersBuffer = new GraphicsBuffer(GraphicsBuffer.Target.Structured, 3, sizeof(uint)); 
         indirectArgsBuffer = new GraphicsBuffer(GraphicsBuffer.Target.IndirectArguments, 1, 5 * sizeof(uint)); 
-        globalIdCounterBuffer = new GraphicsBuffer(GraphicsBuffer.Target.Structured, 1, sizeof(uint));  // 全局ID计数器
+        globalIdCounterBuffer = new GraphicsBuffer(GraphicsBuffer.Target.Structured, 2, sizeof(uint));  // 全局ID计数器[0]=粒子ID, [1]=调试索引
         emittersBuffer = new GraphicsBuffer(GraphicsBuffer.Target.Structured, Mathf.Max(1, emitters.Count), Marshal.SizeOf<EmitterGPU>()); 
         forceFieldsBuffer = new GraphicsBuffer(GraphicsBuffer.Target.Structured, Mathf.Max(1, forceFields.Count), Marshal.SizeOf<ForceFieldGPU>()); 
 
-        // =================================================================================
-        //     【核心修正】初始化调试缓冲区，清除垃圾数据
-        // =================================================================================
-        _debugBuffer = new GraphicsBuffer(GraphicsBuffer.Target.Structured, DEBUG_COUNT, Marshal.SizeOf<DebugData>());
-        _debugDataArray = new DebugData[DEBUG_COUNT];
-        
-        // 创建一个临时的、干净的数组
-        DebugData[] initialDebugData = new DebugData[DEBUG_COUNT];
-        for(int i = 0; i < DEBUG_COUNT; i++)
-        {
-            initialDebugData[i] = new DebugData
-            {
-                particleId = 0,
-                emitterId = 9999, // 使用一个无效的ID作为标记
-                inPosition = Vector3.zero
-                // 其他字段默认为0
-            };
-        }
-        // 将干净的数据上传到GPU，覆盖掉所有垃圾数据
-        _debugBuffer.SetData(initialDebugData);
-        // =================================================================================
+        // （调试缓冲区初始化已移除）
     }
 
     void InitializeParticles() 
@@ -292,7 +269,7 @@ void Update()
         deadPoolBuffer.SetData(deadIndices); 
         uint[] counters = new uint[] { (uint)ParticleConstants.MAX_PARTICLES, 0, 0 }; 
         countersBuffer.SetData(counters); 
-        uint[] globalIdCounter = new uint[] { 0 };  // 初始化全局ID计数器为0
+        uint[] globalIdCounter = new uint[] { 0, 0 };  // [0]=粒子ID, [1]=调试索引
         globalIdCounterBuffer.SetData(globalIdCounter);
         uint[] args = new uint[5] { 0, 0, 0, 0, 0 }; 
         if (particleMesh != null) 
@@ -301,11 +278,18 @@ void Update()
     }
     void SetupCamera() 
     { 
-        if (Camera.main != null) 
+        var cam = Camera.main; 
+        if (cam == null) return; 
+        if (forceBlackBackground) 
         { 
-            Camera.main.backgroundColor = Color.black; 
-            Camera.main.clearFlags = CameraClearFlags.SolidColor; 
+            cam.clearFlags = CameraClearFlags.SolidColor; 
+            cam.backgroundColor = backgroundColor; 
         } 
+        if (disablePostProcessing) 
+        { 
+            var urpData = cam.GetComponent<UniversalAdditionalCameraData>(); 
+            if (urpData != null) urpData.renderPostProcessing = false; 
+        }
     }
 
     void ReleaseBuffers() 
@@ -319,110 +303,8 @@ void Update()
         globalIdCounterBuffer?.Release();  // 释放全局ID计数器缓冲区
         emittersBuffer?.Release(); 
         forceFieldsBuffer?.Release(); 
-        // =================================================================================
-        //     DEBUGGING: 释放调试缓冲区
-        // =================================================================================
-        _debugBuffer?.Release();
-        // =================================================================================
+        // （调试缓冲区释放已移除）
     }
     
-    void SetupDebugLogging()
-    {
-        // 创建调试日志文件路径
-        string timestamp = System.DateTime.Now.ToString("yyyy-MM-dd_HH-mm-ss");
-        _debugLogPath = System.IO.Path.Combine(Application.persistentDataPath, $"GPU_Particle_Debug_{timestamp}.txt");
-        
-        // 写入文件头信息
-        string header = $"=== GPU Particle System Debug Log ===\n" +
-                       $"Start Time: {System.DateTime.Now}\n" +
-                       $"Max Particles: {ParticleConstants.MAX_PARTICLES}\n" +
-                       $"Debug Count: {DEBUG_COUNT}\n" +
-                       $"=====================================\n\n";
-        
-        System.IO.File.WriteAllText(_debugLogPath, header);
-        Debug.Log($"📝 Debug log file created: {_debugLogPath}");
-        Debug.Log($"📁 File location: {Application.persistentDataPath}");
-        Debug.Log($"🔍 Full path: {System.IO.Path.GetFullPath(_debugLogPath)}");
-        Debug.Log($"📂 Directory: {System.IO.Path.GetDirectoryName(_debugLogPath)}");
-    }
-    
-    void WriteDebugInfoToFile()
-    {
-        if (string.IsNullOrEmpty(_debugLogPath)) return;
-        
-        try
-        {
-            string logContent = $"\n--- Frame {Time.frameCount} Debug Info ({System.DateTime.Now:HH:mm:ss.fff}) ---\n";
-            
-            // 添加相机信息
-            if (Camera.main != null)
-            {
-                logContent += $"Camera Position: {Camera.main.transform.position}\n";
-                logContent += $"Camera Rotation: {Camera.main.transform.rotation.eulerAngles}\n\n";
-            }
-            
-            // 添加发射器信息
-            logContent += $"--- Emitter Configuration ---\n";
-            for (int i = 0; i < emitters.Count; i++)
-            {
-                var e = emitters[i];
-                logContent += $"  Emitter {i}: name={e.name}, pos=({e.position.x:F2}, {e.position.y:F2}, {e.position.z:F2}), radius={e.radius}\n";
-            }
-            logContent += "\n";
-            
-            // 添加粒子调试数据
-            logContent += $"--- Particle Debug Data (First {DEBUG_COUNT} particles) ---\n";
-            for (int i = 0; i < DEBUG_COUNT; i++)
-            {
-                var data = _debugDataArray[i];
-                
-                // 获取发射器名称
-                string emitterName = "Unknown Emitter";
-                int emitterIndex = Mathf.RoundToInt(data.emitterId);
-                
-                if (emitterIndex >= 0 && emitterIndex < emitters.Count)
-                {
-                    emitterName = emitters[emitterIndex].name;
-                }
-                
-                logContent += $"[{emitterName} | Particle {i}] Global ID: {data.particleId} (Index: {i})\n" +
-                             $"  - In Position:       {data.inPosition}\n" +
-                             $"  - Attractor State:   Pos={data.attractorPosition}, Str={data.attractorStrength}, Enabled={data.attractorEnabled}\n" +
-                             $"  - Acceleration:      {data.acceleration}\n" +
-                             $"  - Out Position:      {data.outPosition}\n\n";
-            }
-            
-            logContent += $"\n{new string('=', 50)}\n\n";
-            
-            // 追加到文件
-            System.IO.File.AppendAllText(_debugLogPath, logContent);
-            Debug.Log($"📝 Debug info written to file: {_debugLogPath}");
-        }
-        catch (System.Exception e)
-        {
-            Debug.LogError($"Failed to write debug info to file: {e.Message}");
-        }
-    }
-    
-    [ContextMenu("Show Debug File Path")]
-    void ShowDebugFilePath()
-    {
-        if (string.IsNullOrEmpty(_debugLogPath))
-        {
-            Debug.LogWarning("Debug log path is not set yet. Run the game first.");
-            return;
-        }
-        
-        Debug.Log($"📝 Current debug file: {_debugLogPath}");
-        Debug.Log($"🔍 Full path: {System.IO.Path.GetFullPath(_debugLogPath)}");
-        Debug.Log($"📂 Directory: {System.IO.Path.GetDirectoryName(_debugLogPath)}");
-        Debug.Log($"📄 File exists: {System.IO.File.Exists(_debugLogPath)}");
-        
-        if (System.IO.File.Exists(_debugLogPath))
-        {
-            var fileInfo = new System.IO.FileInfo(_debugLogPath);
-            Debug.Log($"📊 File size: {fileInfo.Length} bytes");
-            Debug.Log($"🕒 Last modified: {fileInfo.LastWriteTime}");
-        }
-    }
+    // （调试方法已移除）
 }

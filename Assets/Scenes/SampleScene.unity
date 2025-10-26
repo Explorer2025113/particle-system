@@ -192,7 +192,7 @@ Camera:
   m_TargetEye: 3
   m_HDR: 1
   m_AllowMSAA: 1
-  m_AllowDynamicResolution: 0
+  m_AllowDynamicResolution: 1
   m_ForceIntoRT: 0
   m_OcclusionCulling: 1
   m_StereoConvergence: 10
@@ -206,7 +206,7 @@ Transform:
   m_GameObject: {fileID: 330585543}
   serializedVersion: 2
   m_LocalRotation: {x: 0, y: 0, z: 0, w: 1}
-  m_LocalPosition: {x: 0, y: 5, z: -10}
+  m_LocalPosition: {x: 0, y: 5, z: -300}
   m_LocalScale: {x: 1, y: 1, z: 1}
   m_ConstrainProportionsScale: 0
   m_Children: []
@@ -456,43 +456,25 @@ MonoBehaviour:
   m_Name: 
   m_EditorClassIdentifier: 
   emitters:
-  - name: Cyan River
+  - name: Red
     enabled: 1
-    emissionRate: 80000
-    position: {x: -20, y: 0, z: 0}
-    radius: 8
-    initialVelocity: {x: 0, y: 0, z: 0}
-    minInitialSpeed: 15
-    maxInitialSpeed: 20
-    color: {r: 0, g: 1, b: 1, a: 0}
-  - name: Red Nebula
-    enabled: 1
-    emissionRate: 20000
+    emissionRate: 0
     position: {x: 0, y: 0, z: 0}
-    radius: 15
+    radius: 5
     initialVelocity: {x: 0, y: 0, z: 0}
-    minInitialSpeed: 0.5
-    maxInitialSpeed: 1
-    color: {r: 1, g: 0.19275662, b: 0, a: 0}
-  - name: Purple Vortex Emitter
-    enabled: 1
-    emissionRate: 30000
-    position: {x: 20, y: 0, z: 0}
-    radius: 2
-    initialVelocity: {x: 0, y: 0, z: 0}
-    minInitialSpeed: 2
-    maxInitialSpeed: 4
-    color: {r: 0.9622642, g: 0.0199715, b: 0.7726884, a: 0}
+    minInitialSpeed: 1
+    maxInitialSpeed: 2
+    color: {r: 1, g: 0, b: 0, a: 0}
   forceFields:
   - name: Central Attractor
     enabled: 1
     position: {x: 0, y: 0, z: 0}
     radius: 40
-    strength: 10
+    strength: 5
   globalForce: {x: 0, y: 0, z: 0}
   curlNoiseEnabled: 1
   curlNoiseScale: 0.05
-  curlNoiseStrength: 25
+  curlNoiseStrength: 1
   minLifetime: 8
   maxLifetime: 12
   drag: 0.1
@@ -505,6 +487,25 @@ MonoBehaviour:
   computeShader: {fileID: 7200000, guid: 3c6601f9fc10ce54eb70bddd50e71f14, type: 3}
   particleMaterial: {fileID: 2100000, guid: 0912fdec9e4859641a51acd5cb1b5bc3, type: 2}
   particleMesh: {fileID: 10210, guid: 0000000000000000e000000000000000, type: 0}
+  colorOverLifeTex: {fileID: 0}
+  sizeOverLifeTex: {fileID: 0}
+  forceBlackBackground: 1
+  backgroundColor: {r: 0, g: 0, b: 0, a: 1}
+  disablePostProcessing: 1
+  ringOrbitEnabled: 0
+  ringCenter: {x: 0, y: 0, z: 0}
+  ringAxis: {x: 0, y: 1, z: 0}
+  ringRadius: 20
+  ringThickness: 4
+  ringGravity: 50
+  ringPlaneDamping: 2
+  orbitSpeedScale: 1
+  flowRibbonEnabled: 1
+  flowDirection: {x: 1, y: 0, z: 0}
+  flowNoiseScale: 0.03
+  flowNoiseStrength: 3
+  flowConfinement: 3
+  flowDragBoost: 0.5
 --- !u!4 &1414393514
 Transform:
   m_ObjectHideFlags: 0

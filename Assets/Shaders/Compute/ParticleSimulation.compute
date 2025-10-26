@@ -20,12 +20,12 @@ struct Particle
 };
 
 struct Emitter 
-{ 
-    float4 position; 
-    float4 initialVelocity; 
-    float4 speedMinMax; 
-    float4 color; 
-    float4 ratesAndEnabled; 
+{
+    float4 position;
+    float4 initialVelocity;
+    float4 speedMinMax;
+    float4 color;
+    float4 ratesAndEnabled;
 };
 
 struct ForceField 
@@ -34,21 +34,7 @@ struct ForceField
     float4 strengthAndEnabled; 
 };
 
-// =================================================================
-//     DEBUGGING: 用于从GPU回读数据的结构体
-// =================================================================
-struct DebugData
-{
-    uint particleId;
-    float emitterId; 
-    float3 inPosition;
-    float3 attractorPosition;
-    float attractorStrength;
-    float attractorEnabled;
-    float3 acceleration;
-    float3 outPosition;
-};
-// =================================================================
+// （调试结构已移除）
 
 
 // --- Buffers ---
@@ -61,11 +47,7 @@ RWStructuredBuffer<uint> _IndirectArgs;
 RWStructuredBuffer<uint> _GlobalIdCounter;  // 全局ID计数器
 StructuredBuffer<Emitter> _Emitters;
 StructuredBuffer<ForceField> _ForceFields;
-// =================================================================
-//     DEBUGGING: 声明调试缓冲区
-// =================================================================
-RWStructuredBuffer<DebugData> _DebugBuffer;
-// =================================================================
+// （调试缓冲区已移除）
 
 // --- Uniforms ---
 float _DeltaTime;
@@ -85,6 +67,22 @@ int _ForceFieldCount;
 bool _ColorOverLife;
 bool _VelocityToColor;
 float _MaxSpeedForColor;
+// OpenGL-parity controls
+// 移除OpenGL对齐的可选字段（保持为0/false亦兼容）
+bool _RingOrbitEnabled;
+float3 _RingCenter;
+float3 _RingAxis;
+float _RingRadius;
+float _RingThickness;
+float _RingGravity;
+float _RingPlaneDamping;
+float _OrbitSpeedScale;
+bool _FlowRibbonEnabled;
+float3 _FlowDirection;
+float _FlowNoiseScale;
+float _FlowNoiseStrength;
+float _FlowConfinement;
+float _FlowDragBoost;
 
 // --- Utility Functions ---
 float rand(float2 co) 
@@ -165,7 +163,13 @@ void Emit(uint3 id : SV_DispatchThreadID)
     p.padding2 = 0;
     p.padding3 = 0;
     
-    // 计算随机方向和位置
+    // 设置发射器参数
+    float3 emitter_pos = emitter.position.xyz; 
+    float emitter_radius = emitter.position.w; 
+    float min_speed = emitter.speedMinMax.x; 
+    float max_speed = emitter.speedMinMax.y; 
+    
+    // 计算随机方向和位置（球体内均匀分布）
     float3 random_vec = float3(
         rand(id.xy + _Seeds.xy * 0.3) - 0.5,
         rand(id.yx + _Seeds.yz * 0.7) - 0.5,
@@ -173,17 +177,11 @@ void Emit(uint3 id : SV_DispatchThreadID)
     ) * 2.0; 
     float3 safe_random_dir = SafeNormalize(random_vec); 
     
-    // 设置发射器参数
-    float3 emitter_pos = emitter.position.xyz; 
-    float emitter_radius = emitter.position.w; 
-    float min_speed = emitter.speedMinMax.x; 
-    float max_speed = emitter.speedMinMax.y; 
-    float3 initial_vel = emitter.initialVelocity.xyz; 
-    
-    // 计算最终位置和速度
-    p.position = float4(emitter_pos + safe_random_dir * emitter_radius * rand(id.yx + _Seeds.xz), 1.0); 
+    // 在发射器球体内随机生成位置（体积均匀采样：r ~ cbrt(u)）
+    float distance_from_center = pow(rand(id.yx + _Seeds.xz), 1.0/3.0) * emitter_radius;
+    p.position = float4(emitter_pos + safe_random_dir * distance_from_center, 1.0); 
     float speed = lerp(min_speed, max_speed, rand(id.yx + _Seeds.zy)); 
-    p.velocity = float4(initial_vel + safe_random_dir * speed, 0); 
+    p.velocity = float4(emitter.initialVelocity.xyz + safe_random_dir * speed, 0);
     p.color = emitter.color; 
     
     _Particles[p_idx] = p; 
@@ -192,23 +190,7 @@ void Emit(uint3 id : SV_DispatchThreadID)
     InterlockedAdd(_Counters[_PingPong_A], 1, alive_insert_idx); 
     _AliveIndices_A[alive_insert_idx] = p_idx; 
 
-    // =================================================================
-    //     DEBUGGING: 记录刚创建的粒子的位置到调试缓冲区
-    // =================================================================
-    if (id.x < 10) // 只记录前10个，防止缓冲区溢出
-    {
-        DebugData debug_data;
-        debug_data.particleId = p.globalId;
-        debug_data.emitterId = p.attributes.x;
-        debug_data.inPosition = p.position.xyz;
-        debug_data.attractorPosition = float3(0, 0, 0);
-        debug_data.attractorStrength = 0;
-        debug_data.attractorEnabled = 0;
-        debug_data.acceleration = float3(0, 0, 0);
-        debug_data.outPosition = p.position.xyz;  // 发射时的位置作为初始输出位置
-        _DebugBuffer[id.x] = debug_data;
-    }
-    // =================================================================
+    // （调试写入已移除）
 }
 [numthreads(THREAD_COUNT_1D, 1, 1)]
 void Simulate(uint3 id : SV_DispatchThreadID)
@@ -219,19 +201,7 @@ void Simulate(uint3 id : SV_DispatchThreadID)
     uint p_idx = _AliveIndices_A[id.x];
     Particle p = _Particles[p_idx];
 
-    // =================================================================
-    //     DEBUGGING: 初始化调试结构体
-    // =================================================================
-    DebugData debug_data;
-    debug_data.particleId = p.globalId;  // 使用全局ID而不是索引
-    debug_data.inPosition = p.position.xyz;
-    debug_data.emitterId = p.attributes.x; // 从attributes.x获取emitterId
-    debug_data.attractorPosition = float3(0, 0, 0);
-    debug_data.attractorStrength = 0;
-    debug_data.attractorEnabled = 0;
-    debug_data.acceleration = float3(0, 0, 0);
-    debug_data.outPosition = float3(0, 0, 0);
-    // =================================================================
+    // （调试初始化已移除）
 
     p.lifetime.x += _DeltaTime;
 
@@ -251,13 +221,7 @@ void Simulate(uint3 id : SV_DispatchThreadID)
             ForceField ff = _ForceFields[i];
             float ff_enabled = ff.strengthAndEnabled.y;
 
-            // 【已修复】只在处理第一个力场时，更新调试信息
-            if (i == 0)
-            {
-                debug_data.attractorPosition = ff.positionAndRadius.xyz;
-                debug_data.attractorStrength = ff.strengthAndEnabled.x;
-                debug_data.attractorEnabled = ff_enabled;
-            }
+            // （调试捕获已移除）
 
             if (ff_enabled > 0.5)
             {
@@ -270,23 +234,58 @@ void Simulate(uint3 id : SV_DispatchThreadID)
 
                 if (dist > 0.00001 && dist < ff_radius)
                 {
-                    float falloff = 1.0 - (dist / ff_radius);
+                    float t = saturate(dist / ff_radius);
+                    float falloff = smoothstep(1.0, 0.0, t); // 边缘更平滑，避免尖刺
                     acceleration += (dir / dist) * ff_strength * falloff * falloff;
                 }
             }
         }
         
-        if (_CurlNoiseEnabled)
+        if (_FlowRibbonEnabled)
+        {
+            // 主流向 + 细尺度curl噪声 → 丝带式流动
+            float3 dir = normalize(_FlowDirection);
+            float3 curl = curlNoise(p.position.xyz * _FlowNoiseScale);
+            acceleration += dir * 1.0 + curl * _FlowNoiseStrength;
+            if (_FlowDragBoost > 0.0)
+            {
+                p.velocity.xyz *= (1.0 - _FlowDragBoost * _DeltaTime);
+            }
+        }
+        else if (_RingOrbitEnabled)
+        {
+            // 将粒子拉向环面并赋予切向速度，形成类似星环的轨道运动
+            float3 axis = normalize(_RingAxis);
+            // 投影到环平面
+            float3 toCenter = p.position.xyz - _RingCenter;
+            float planeDist = dot(toCenter, axis);
+            float3 inPlane = toCenter - planeDist * axis;
+            float distInPlane = length(inPlane);
+            float3 dirInPlane = distInPlane > 1e-5 ? inPlane / distInPlane : float3(1,0,0);
+
+            // 向环半径处的径向弹簧力（把粒子吸到理想半径）
+            float radialError = distInPlane - _RingRadius;
+            float3 radialForce = -dirInPlane * radialError * _RingGravity;
+
+            // 拉回到环平面（消除法向偏移）
+            float3 planeForce = -axis * planeDist * _RingPlaneDamping;
+
+            // 切向速度（右手正交：轴 × 径向）
+            float3 tangent = normalize(cross(axis, dirInPlane));
+            float desiredSpeed = sqrt(max(0.0, _RingGravity * _RingRadius)) * _OrbitSpeedScale;
+            float3 orbitVel = tangent * desiredSpeed;
+
+            acceleration += radialForce + planeForce;
+            // 轻度趋向切向速度
+            p.velocity.xyz = lerp(p.velocity.xyz, orbitVel, 0.04);
+        }
+        else if (_CurlNoiseEnabled)
         {
             float3 curl = curlNoise(p.position.xyz * _CurlNoiseScale);
             acceleration += curl * _CurlNoiseStrength;
         }
 
-        // =================================================================
-        //     DEBUGGING: 捕获最终加速度
-        // =================================================================
-        debug_data.acceleration = acceleration;
-        // =================================================================
+        // （调试加速度捕获已移除）
 
         p.velocity.xyz += acceleration * _DeltaTime;
         p.velocity.xyz *= (1.0 - _Drag * _DeltaTime);
@@ -304,14 +303,6 @@ void Simulate(uint3 id : SV_DispatchThreadID)
         _AliveIndices_B[alive_insert_idx] = p_idx;
         InterlockedAdd(_IndirectArgs[1], 1);
 
-        // =================================================================
-        //     DEBUGGING: 捕获输出状态并写入缓冲区
-        // =================================================================
-        debug_data.outPosition = p.position.xyz;
-        if (id.x < 10) // 只写入前10个，防止缓冲区溢出
-        {
-            _DebugBuffer[id.x] = debug_data;
-        }
-        // =================================================================
+        // （调试输出写入已移除）
     }
 }
