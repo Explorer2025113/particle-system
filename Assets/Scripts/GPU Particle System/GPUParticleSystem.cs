@@ -9,14 +9,16 @@ public class GPUParticleSystem : MonoBehaviour
     [System.Serializable]
     public struct Emitter { public string name; public bool enabled; public int emissionRate; public Vector3 position; public float radius; public Vector3 initialVelocity; public float minInitialSpeed; public float maxInitialSpeed; public Color color; }
     
-    [System.Serializable]
-    public struct ForceField { public string name; public bool enabled; public Vector3 position; public float radius; public float strength; }
+    // 旧力场结构已移除
+
+    // 移除多涡旋/环带/丝带模式，改为银河盘模式参数
 
     [StructLayout(LayoutKind.Sequential)]
     private struct EmitterGPU { public Vector4 position; public Vector4 initialVelocity; public Vector4 speedMinMax; public Color color; public Vector4 ratesAndEnabled; }
 
-    [StructLayout(LayoutKind.Sequential)]
-    private struct ForceFieldGPU { public Vector4 positionAndRadius; public Vector4 strengthAndEnabled; }
+    //
+
+    // 无需额外结构
 
     // （调试系统已移除）
     private int _lastVisiblePingPong = 1; // 与渲染一致的可见Alive列表
@@ -24,12 +26,27 @@ public class GPUParticleSystem : MonoBehaviour
     [Header("Emitters")]
     public List<Emitter> emitters = new List<Emitter>();
     [Header("Global Forces")]
-    public List<ForceField> forceFields = new List<ForceField>();
     public Vector3 globalForce = Vector3.zero;
-    [Header("Curl Noise (Vortex) Settings")]
-    public bool curlNoiseEnabled = true;
-    public float curlNoiseScale = 0.05f;
-    public float curlNoiseStrength = 3.0f; // 柔和一些
+    
+    [Header("Galactic Disk Mode")] 
+    public bool galacticDiskEnabled = true;
+    public float diskRadius = 150f;            // 盘最大半径
+    public float diskHalfThickness = 3f;       // 盘半厚度（y方向）
+    public float centerGravity = 20f;          // 中心引力强度（越大越收紧）
+    public float planeDamping = 3f;            // 拉回到盘面的强度
+    public float flatRotationSpeed = 25f;      // 外盘趋于平坦的切向速度上限
+    public float rotationScaleRadius = 50f;    // 切向速度上升尺度 r0
+    public int spiralArms = 3;                 // 螺旋臂数量
+    public float spiralTightness = 1.2f;       // 对数螺旋紧致度 b
+    public float spiralForce = 6f;             // 沿对数螺旋的压缩力强度
+    public float tangentialAlign = 0.06f;      // 速度向切向对齐的混合系数
+    public float edgeOutflowStrength = 1.2f;   // 外缘离心外飘强度
+    public float edgeOutflowExponent = 2.0f;   // 外缘权重指数（越大越只作用在边缘）
+    [Header("Galactic Colors")]
+    public bool radialColorEnabled = true;
+    public Color coreColor = new Color(1.0f,0.95f,0.7f);     // 暖白黄
+    public Color midColor = new Color(0.75f,0.7f,0.9f);      // 淡紫灰
+    public Color outerColor = new Color(0.45f,0.5f,0.65f);   // 冷蓝灰
     
     [Header("Simulation Settings")]
     public float minLifetime = 5.0f;
@@ -39,9 +56,9 @@ public class GPUParticleSystem : MonoBehaviour
     public bool colorOverLife = false; // 关闭颜色统一化，保留发射器原色
     public bool velocityToColor = true; // 启用速度着色
     public float maxSpeedForColor = 20.0f;
-        [Header("General Settings")]
+    [Header("General Settings")]
      public bool prewarm = true;   // 启用预热，启动即有粒子
-     public float prewarmTime = 10.0f;
+    public float prewarmTime = 10.0f;
     public Vector3 renderBounds = new Vector3(100, 100, 100);
     [Header("References")]
     public ComputeShader computeShader;
@@ -55,29 +72,17 @@ public class GPUParticleSystem : MonoBehaviour
     public bool forceBlackBackground = true;
     public Color backgroundColor = Color.black;
     public bool disablePostProcessing = true;
+    public bool autoFrameCameraOnStart = true;
+    public float cameraElevationDeg = 25f;   // 仰角（0=俯视盘面，90=从正上）
+    public float cameraYawDeg = 30f;         // 水平旋转
+    public float cameraMargin = 1.15f;       // 画面边缘留白
 
-    [Header("Ring Orbit Mode")]
-    public bool ringOrbitEnabled = false;
-    public Vector3 ringCenter = Vector3.zero;
-    public Vector3 ringAxis = Vector3.up;
-    public float ringRadius = 20f;
-    public float ringThickness = 4f;
-    public float ringGravity = 50f; // 近似万有引力常数（越大越紧密）
-    public float ringPlaneDamping = 2.0f; // 拉回到环平面的强度
-    public float orbitSpeedScale = 1.0f; // 速度缩放（>1 更快）
-
-    [Header("Flow Ribbon (Nebula) Mode")]
-    public bool flowRibbonEnabled = false;
-    public Vector3 flowDirection = new Vector3(1, 0, 0);
-    public float flowNoiseScale = 0.03f;
-    public float flowNoiseStrength = 3.0f;
-    public float flowConfinement = 0.0f; // 预留，可用于带状约束
-    public float flowDragBoost = 0.0f;   // 预留，可额外增加阻尼
+    // 旧 Ring/Flow 参数组已移除
 
     private int kernelUpdateArgs, kernelEmit, kernelSimulate;
     private GraphicsBuffer particleBuffer, deadPoolBuffer, aliveIndicesBufferA, aliveIndicesBufferB, countersBuffer, indirectArgsBuffer;
     private GraphicsBuffer globalIdCounterBuffer;  // 全局ID计数器缓冲区
-    private GraphicsBuffer emittersBuffer, forceFieldsBuffer;
+    private GraphicsBuffer emittersBuffer;
     private GraphicsBuffer[] aliveIndicesBuffers;
     private int pingPongA = 1, pingPongB = 2;
     private const int THREAD_COUNT_1D = 256;
@@ -87,6 +92,7 @@ public class GPUParticleSystem : MonoBehaviour
         InitializeBuffers(); 
         InitializeParticles(); 
         SetupCamera(); 
+        // 无默认随机配置
         if (prewarm) 
         { 
             float fixedDeltaTime = 1.0f / 30.0f; 
@@ -126,41 +132,39 @@ void Update()
         computeShader.SetFloat("_MaxLifetime", maxLifetime);
         computeShader.SetFloat("_Drag", drag);
         computeShader.SetVector("_GlobalForce", globalForce);
-        computeShader.SetBool("_CurlNoiseEnabled", curlNoiseEnabled);
-        computeShader.SetFloat("_CurlNoiseScale", curlNoiseScale);
-        computeShader.SetFloat("_CurlNoiseStrength", curlNoiseStrength);
+        // —— 删除 Curl/Multi/Ring/Flow ——
         // 已还原：不再下发 OpenGL 对齐的粘性/重力/常量速度参数
         computeShader.SetBool("_ColorOverLife", colorOverLife);
         computeShader.SetBool("_VelocityToColor", velocityToColor);
         computeShader.SetFloat("_MaxSpeedForColor", maxSpeedForColor);
 
-        // Ring Orbit uniforms
-        computeShader.SetBool("_RingOrbitEnabled", ringOrbitEnabled);
-        computeShader.SetVector("_RingCenter", ringCenter);
-        computeShader.SetVector("_RingAxis", ringAxis);
-        computeShader.SetFloat("_RingRadius", ringRadius);
-        computeShader.SetFloat("_RingThickness", ringThickness);
-        computeShader.SetFloat("_RingGravity", ringGravity);
-        computeShader.SetFloat("_RingPlaneDamping", ringPlaneDamping);
-        computeShader.SetFloat("_OrbitSpeedScale", orbitSpeedScale);
-
-        // Flow Ribbon uniforms
-        computeShader.SetBool("_FlowRibbonEnabled", flowRibbonEnabled);
-        computeShader.SetVector("_FlowDirection", flowDirection);
-        computeShader.SetFloat("_FlowNoiseScale", flowNoiseScale);
-        computeShader.SetFloat("_FlowNoiseStrength", flowNoiseStrength);
-        computeShader.SetFloat("_FlowConfinement", flowConfinement);
-        computeShader.SetFloat("_FlowDragBoost", flowDragBoost);
+        // Galactic Disk uniforms
+        computeShader.SetBool("_GalacticDiskEnabled", galacticDiskEnabled);
+        computeShader.SetFloat("_DiskRadius", diskRadius);
+        computeShader.SetFloat("_DiskHalfThickness", diskHalfThickness);
+        computeShader.SetFloat("_CenterGravity", centerGravity);
+        computeShader.SetFloat("_PlaneDamping", planeDamping);
+        computeShader.SetFloat("_FlatRotationSpeed", flatRotationSpeed);
+        computeShader.SetFloat("_RotationScaleRadius", rotationScaleRadius);
+        computeShader.SetInt("_SpiralArms", spiralArms);
+        computeShader.SetFloat("_SpiralTightness", spiralTightness);
+        computeShader.SetFloat("_SpiralForce", spiralForce);
+        computeShader.SetFloat("_TangentialAlign", tangentialAlign);
+        computeShader.SetFloat("_EdgeOutflowStrength", edgeOutflowStrength);
+        computeShader.SetFloat("_EdgeOutflowExponent", edgeOutflowExponent);
+        // Radial color
+        computeShader.SetBool("_RadialColorEnabled", radialColorEnabled);
+        computeShader.SetVector("_CoreColor", (Vector4)coreColor);
+        computeShader.SetVector("_MidColor", (Vector4)midColor);
+        computeShader.SetVector("_OuterColor", (Vector4)outerColor);
 
         if (emitters.Count > 0) { var gpuEmitters = emitters.Select(e => new EmitterGPU { position = new Vector4(e.position.x, e.position.y, e.position.z, e.radius), initialVelocity = e.initialVelocity, speedMinMax = new Vector4(e.minInitialSpeed, e.maxInitialSpeed, 0, 0), color = e.color, ratesAndEnabled = new Vector4(e.emissionRate, e.enabled ? 1.0f : 0.0f, 0, 0) }).ToArray(); emittersBuffer.SetData(gpuEmitters); }
-        if (forceFields.Count > 0) { var gpuForceFields = forceFields.Select(f => new ForceFieldGPU { positionAndRadius = new Vector4(f.position.x, f.position.y, f.position.z, f.radius), strengthAndEnabled = new Vector4(f.strength, f.enabled ? 1.0f : 0.0f, 0, 0) }).ToArray(); forceFieldsBuffer.SetData(gpuForceFields); }
-        computeShader.SetInt("_ForceFieldCount", forceFields.Count);
     }
     
     bool RunSimulationStep(float deltaTime) 
     { 
         computeShader.SetBuffer(kernelEmit, "_Emitters", emittersBuffer); 
-        computeShader.SetBuffer(kernelSimulate, "_ForceFields", forceFieldsBuffer); 
+        // 不再需要力场与涡旋缓冲
         computeShader.SetBuffer(kernelUpdateArgs, "_Counters", countersBuffer); 
         computeShader.SetBuffer(kernelUpdateArgs, "_IndirectArgs", indirectArgsBuffer); 
         computeShader.SetBuffer(kernelEmit, "_Particles", particleBuffer); 
@@ -177,7 +181,7 @@ void Update()
         computeShader.Dispatch(kernelUpdateArgs, 1, 1, 1); 
         
         // （调试索引重置已移除）
-        
+
         // =================================================================================
         //     【核心修改】先执行所有Emit，确保初始位置被记录
         // =================================================================================
@@ -236,7 +240,7 @@ void Update()
         indirectArgsBuffer = new GraphicsBuffer(GraphicsBuffer.Target.IndirectArguments, 1, 5 * sizeof(uint)); 
         globalIdCounterBuffer = new GraphicsBuffer(GraphicsBuffer.Target.Structured, 2, sizeof(uint));  // 全局ID计数器[0]=粒子ID, [1]=调试索引
         emittersBuffer = new GraphicsBuffer(GraphicsBuffer.Target.Structured, Mathf.Max(1, emitters.Count), Marshal.SizeOf<EmitterGPU>()); 
-        forceFieldsBuffer = new GraphicsBuffer(GraphicsBuffer.Target.Structured, Mathf.Max(1, forceFields.Count), Marshal.SizeOf<ForceFieldGPU>()); 
+        //
 
         // （调试缓冲区初始化已移除）
     }
@@ -290,6 +294,28 @@ void Update()
             var urpData = cam.GetComponent<UniversalAdditionalCameraData>(); 
             if (urpData != null) urpData.renderPostProcessing = false; 
         }
+
+        if (autoFrameCameraOnStart)
+        {
+            FrameCameraToDisk(cam);
+        }
+    }
+
+    [ContextMenu("Frame Camera To Disk")]
+    void CM_FrameCamera() { var cam = Camera.main; if (cam!=null) FrameCameraToDisk(cam); }
+
+    void FrameCameraToDisk(Camera cam)
+    {
+        Vector3 center = Vector3.zero; // 我们的盘心在世界原点
+        float R = Mathf.Max(10f, diskRadius);
+        float fovRad = cam.fieldOfView * Mathf.Deg2Rad;
+        float distance = (R * cameraMargin) / Mathf.Max(0.0001f, Mathf.Tan(fovRad * 0.5f));
+        Quaternion rot = Quaternion.Euler(cameraElevationDeg, cameraYawDeg, 0f);
+        Vector3 offset = rot * (Vector3.back * distance);
+        cam.transform.position = center + offset;
+        cam.transform.rotation = Quaternion.LookRotation(center - cam.transform.position, Vector3.up);
+        cam.nearClipPlane = 0.1f;
+        cam.farClipPlane = Mathf.Max(cam.farClipPlane, R * 6f);
     }
 
     void ReleaseBuffers() 
@@ -302,7 +328,7 @@ void Update()
         indirectArgsBuffer?.Release(); 
         globalIdCounterBuffer?.Release();  // 释放全局ID计数器缓冲区
         emittersBuffer?.Release(); 
-        forceFieldsBuffer?.Release(); 
+        //
         // （调试缓冲区释放已移除）
     }
     

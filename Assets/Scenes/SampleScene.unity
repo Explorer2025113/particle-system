@@ -458,23 +458,29 @@ MonoBehaviour:
   emitters:
   - name: Red
     enabled: 1
-    emissionRate: 0
+    emissionRate: 5000
     position: {x: 0, y: 0, z: 0}
-    radius: 5
+    radius: 50
     initialVelocity: {x: 0, y: 0, z: 0}
     minInitialSpeed: 1
     maxInitialSpeed: 2
     color: {r: 1, g: 0, b: 0, a: 0}
-  forceFields:
-  - name: Central Attractor
-    enabled: 1
-    position: {x: 0, y: 0, z: 0}
-    radius: 40
-    strength: 5
   globalForce: {x: 0, y: 0, z: 0}
-  curlNoiseEnabled: 1
-  curlNoiseScale: 0.05
-  curlNoiseStrength: 1
+  galacticDiskEnabled: 1
+  diskRadius: 150
+  diskHalfThickness: 3
+  centerGravity: 20
+  planeDamping: 3
+  flatRotationSpeed: 25
+  rotationScaleRadius: 50
+  spiralArms: 3
+  spiralTightness: 1.2
+  spiralForce: 6
+  tangentialAlign: 0.06
+  radialColorEnabled: 1
+  coreColor: {r: 1, g: 0.95, b: 0.7, a: 1}
+  midColor: {r: 0.75, g: 0.7, b: 0.9, a: 1}
+  outerColor: {r: 0.45, g: 0.5, b: 0.65, a: 1}
   minLifetime: 8
   maxLifetime: 12
   drag: 0.1
@@ -483,7 +489,7 @@ MonoBehaviour:
   maxSpeedForColor: 20
   prewarm: 1
   prewarmTime: 10
-  renderBounds: {x: 100, y: 100, z: 100}
+  renderBounds: {x: 600, y: 200, z: 600}
   computeShader: {fileID: 7200000, guid: 3c6601f9fc10ce54eb70bddd50e71f14, type: 3}
   particleMaterial: {fileID: 2100000, guid: 0912fdec9e4859641a51acd5cb1b5bc3, type: 2}
   particleMesh: {fileID: 10210, guid: 0000000000000000e000000000000000, type: 0}
@@ -492,20 +498,6 @@ MonoBehaviour:
   forceBlackBackground: 1
   backgroundColor: {r: 0, g: 0, b: 0, a: 1}
   disablePostProcessing: 1
-  ringOrbitEnabled: 0
-  ringCenter: {x: 0, y: 0, z: 0}
-  ringAxis: {x: 0, y: 1, z: 0}
-  ringRadius: 20
-  ringThickness: 4
-  ringGravity: 50
-  ringPlaneDamping: 2
-  orbitSpeedScale: 1
-  flowRibbonEnabled: 1
-  flowDirection: {x: 1, y: 0, z: 0}
-  flowNoiseScale: 0.03
-  flowNoiseStrength: 3
-  flowConfinement: 3
-  flowDragBoost: 0.5
 --- !u!4 &1414393514
 Transform:
   m_ObjectHideFlags: 0

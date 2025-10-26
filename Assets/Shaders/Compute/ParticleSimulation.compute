@@ -28,11 +28,7 @@ struct Emitter
     float4 ratesAndEnabled;
 };
 
-struct ForceField 
-{ 
-    float4 positionAndRadius; 
-    float4 strengthAndEnabled; 
-};
+// 旧力场/多涡旋结构已移除
 
 // （调试结构已移除）
 
@@ -46,7 +42,6 @@ RWStructuredBuffer<uint> _Counters;
 RWStructuredBuffer<uint> _IndirectArgs;
 RWStructuredBuffer<uint> _GlobalIdCounter;  // 全局ID计数器
 StructuredBuffer<Emitter> _Emitters;
-StructuredBuffer<ForceField> _ForceFields;
 // （调试缓冲区已移除）
 
 // --- Uniforms ---
@@ -60,29 +55,30 @@ float _MaxLifetime;
 float _Drag;
 float3 _Seeds;
 float3 _GlobalForce;
-bool _CurlNoiseEnabled;
-float _CurlNoiseScale;
-float _CurlNoiseStrength;
-int _ForceFieldCount;
 bool _ColorOverLife;
 bool _VelocityToColor;
 float _MaxSpeedForColor;
-// OpenGL-parity controls
-// 移除OpenGL对齐的可选字段（保持为0/false亦兼容）
-bool _RingOrbitEnabled;
-float3 _RingCenter;
-float3 _RingAxis;
-float _RingRadius;
-float _RingThickness;
-float _RingGravity;
-float _RingPlaneDamping;
-float _OrbitSpeedScale;
-bool _FlowRibbonEnabled;
-float3 _FlowDirection;
-float _FlowNoiseScale;
-float _FlowNoiseStrength;
-float _FlowConfinement;
-float _FlowDragBoost;
+
+// Galactic Disk uniforms
+bool _GalacticDiskEnabled;
+float _DiskRadius;
+float _DiskHalfThickness;
+float _CenterGravity;
+float _PlaneDamping;
+float _FlatRotationSpeed;
+float _RotationScaleRadius;
+int _SpiralArms;
+float _SpiralTightness; // b
+float _SpiralForce;
+float _TangentialAlign;
+// Radial color mapping
+bool _RadialColorEnabled;
+float3 _CoreColor;
+float3 _MidColor;
+float3 _OuterColor;
+// Edge centrifugal drift
+float _EdgeOutflowStrength;
+float _EdgeOutflowExponent;
 
 // --- Utility Functions ---
 float rand(float2 co) 
@@ -121,7 +117,7 @@ float4 taylorInvSqrt(float4 r)
     return 1.79284291400159 - 0.85373472095314 * r; 
 }
 float snoise(float3 v) { const float2 C = float2(1.0/6.0, 1.0/3.0) ; const float4 D = float4(0.0, 0.5, 1.0, 2.0); float3 i  = floor(v + dot(v, C.yyy) ); float3 x0 = v - i + dot(i, C.xxx) ; float3 g = step(x0.yzx, x0.xyz); float3 l = 1.0 - g; float3 i1 = min( g.xyz, l.zxy ); float3 i2 = max( g.xyz, l.zxy ); float3 x1 = x0 - i1 + C.xxx; float3 x2 = x0 - i2 + C.yyy; float3 x3 = x0 - D.yyy; i = mod289(i);  float4 p = permute( permute( permute( i.z + float4(0.0, i1.z, i2.z, 1.0 )) + i.y + float4(0.0, i1.y, i2.y, 1.0 )) + i.x + float4(0.0, i1.x, i2.x, 1.0 )); float n_ = 0.142857142857; float3 ns = n_ * D.wyz - D.xzx; float4 j = p - 49.0 * floor(p * ns.z * ns.z); float4 x_ = floor(j * ns.z); float4 y_ = floor(j - 7.0 * x_ ); float4 x = x_ * ns.x + ns.yyyy; float4 y = y_ * ns.x + ns.yyyy; float4 h = 1.0 - abs(x) - abs(y); float4 b0 = float4( x.xy, y.xy ); float4 b1 = float4( x.zw, y.zw ); float4 s0 = floor(b0)*2.0 + 1.0; float4 s1 = floor(b1)*2.0 + 1.0; float4 sh = -step(h, float4(0,0,0,0)); float4 a0 = b0.xzyw + s0.xzyw*sh.xxyy; float4 a1 = b1.xzyw + s1.xzyw*sh.zzww; float3 p0 = float3(a0.xy,h.x); float3 p1 = float3(a0.zw,h.y); float3 p2 = float3(a1.xy,h.z); float3 p3 = float3(a1.zw,h.w); float4 norm = taylorInvSqrt(float4(dot(p0,p0), dot(p1,p1), dot(p2, p2), dot(p3,p3))); p0 *= norm.x; p1 *= norm.y; p2 *= norm.z; p3 *= norm.w; float4 m = max(0.6 - float4(dot(x0,x0), dot(x1,x1), dot(x2,x2), dot(x3,x3)), 0.0); m = m * m; return 42.0 * dot( m*m, float4( dot(p0,x0), dot(p1,x1), dot(p2,x2), dot(p3,x3) ) ); }
-float3 curlNoise(float3 p) { const float e = 0.1; float3 dx = float3(e,0,0); float3 dy = float3(0,e,0); float3 dz = float3(0,0,e); float3 p_x0 = p-dx; float3 p_x1=p+dx; float3 p_y0=p-dy; float3 p_y1=p+dy; float3 p_z0=p-dz; float3 p_z1=p+dz; float x=snoise(p_y1)-snoise(p_y0)-snoise(p_z1)+snoise(p_z0); float y=snoise(p_z1)-snoise(p_z0)-snoise(p_x1)+snoise(p_x0); float z=snoise(p_x1)-snoise(p_x0)-snoise(p_y1)+snoise(p_y0); return SafeNormalize(float3(x,y,z)); }
+// 无需 curl/multi-vortex 工具函数
 
 
 // --- KERNELS ---
@@ -169,19 +165,22 @@ void Emit(uint3 id : SV_DispatchThreadID)
     float min_speed = emitter.speedMinMax.x; 
     float max_speed = emitter.speedMinMax.y; 
     
-    // 计算随机方向和位置（球体内均匀分布）
-    float3 random_vec = float3(
-        rand(id.xy + _Seeds.xy * 0.3) - 0.5,
-        rand(id.yx + _Seeds.yz * 0.7) - 0.5,
-        rand(id.xy + _Seeds.zx * 0.1) - 0.5
-    ) * 2.0; 
-    float3 safe_random_dir = SafeNormalize(random_vec); 
-    
-    // 在发射器球体内随机生成位置（体积均匀采样：r ~ cbrt(u)）
-    float distance_from_center = pow(rand(id.yx + _Seeds.xz), 1.0/3.0) * emitter_radius;
-    p.position = float4(emitter_pos + safe_random_dir * distance_from_center, 1.0); 
-    float speed = lerp(min_speed, max_speed, rand(id.yx + _Seeds.zy)); 
-    p.velocity = float4(emitter.initialVelocity.xyz + safe_random_dir * speed, 0);
+    // 薄盘内采样（r ~ sqrt(u)）
+    float u1 = rand(id.xy + _Seeds.xy * 0.37);
+    float u2 = rand(id.yx + _Seeds.yz * 0.71);
+    float r = sqrt(u1) * _DiskRadius;
+    float theta = 6.28318530718 * u2;
+    float y = (rand(id.xy + _Seeds.zx * 0.13) - 0.5) * 2.0 * _DiskHalfThickness;
+    float3 pos = float3(cos(theta) * r, y, sin(theta) * r);
+    p.position = float4(pos + emitter_pos, 1.0);
+    // 切向初速（随半径上升并趋于平坦）
+    float desiredSpeed = _FlatRotationSpeed * (1.0 - exp(-r / max(1e-3, _RotationScaleRadius)));
+    float3 radialDir = normalize(float3(cos(theta), 0, sin(theta)));
+    float3 tangent = float3(-radialDir.z, 0, radialDir.x);
+    float3 v0 = tangent * desiredSpeed;
+    // 少量噪声
+    float3 noise = (float3(rand(id.xy), rand(id.yx), rand(id.xx)) - 0.5) * 0.2 * desiredSpeed;
+    p.velocity = float4(v0 + noise, 0);
     p.color = emitter.color; 
     
     _Particles[p_idx] = p; 
@@ -214,75 +213,54 @@ void Simulate(uint3 id : SV_DispatchThreadID)
     else
     {
         float3 acceleration = _GlobalForce;
-
-        // 【已修复】使用循环来正确处理所有力场
-        for (int i = 0; i < _ForceFieldCount; i++)
+        if (_GalacticDiskEnabled)
         {
-            ForceField ff = _ForceFields[i];
-            float ff_enabled = ff.strengthAndEnabled.y;
+            float3 pos = p.position.xyz;
+            float3 inPlane = float3(pos.x, 0, pos.z);
+            float r = max(1e-3, length(inPlane));
+            float3 radialDir = inPlane / r;
+            float3 tangent = float3(-radialDir.z, 0, radialDir.x);
 
-            // （调试捕获已移除）
+            // 中心引力 ~ 1/r
+            float radialG = _CenterGravity / r;
+            acceleration += -radialDir * radialG;
+            // 拉回盘面
+            acceleration += float3(0, -pos.y * _PlaneDamping, 0);
 
-            if (ff_enabled > 0.5)
+            // 目标切向速度（差速旋转）
+            float desiredSpeed = _FlatRotationSpeed * (1.0 - exp(-r / max(1e-3, _RotationScaleRadius)));
+            float3 vDesired = tangent * desiredSpeed;
+            float r01_align = saturate(r / _DiskRadius);
+            float alignFactor = _TangentialAlign * (1.0 - 0.4 * (r01_align*r01_align)); // 外缘稍减对齐
+            p.velocity.xyz = lerp(p.velocity.xyz, vDesired, alignFactor);
+
+            // 螺旋臂压缩（对数螺旋 theta = b*ln(r)+phi_k）
+            float theta = atan2(pos.z, pos.x);
+            float minAbsErr = 1000.0;
+            float signedErr = 0.0;
+            for (int k = 0; k < max(1,_SpiralArms); k++)
             {
-                float ff_radius = ff.positionAndRadius.w;
-                float3 ff_position = ff.positionAndRadius.xyz;
-                float ff_strength = ff.strengthAndEnabled.x;
-                
-                float3 dir = ff_position - p.position.xyz;
-                float dist = length(dir);
-
-                if (dist > 0.00001 && dist < ff_radius)
+                float phi = 6.28318530718 * (float)k / max(1,_SpiralArms);
+                float target = _SpiralTightness * log(r) + phi;
+                float err = theta - target;
+                // wrap to [-pi, pi]
+                err = err - 6.28318530718 * round(err / 6.28318530718);
+                if (abs(err) < minAbsErr)
                 {
-                    float t = saturate(dist / ff_radius);
-                    float falloff = smoothstep(1.0, 0.0, t); // 边缘更平滑，避免尖刺
-                    acceleration += (dir / dist) * ff_strength * falloff * falloff;
+                    minAbsErr = abs(err);
+                    signedErr = err;
                 }
             }
-        }
-        
-        if (_FlowRibbonEnabled)
-        {
-            // 主流向 + 细尺度curl噪声 → 丝带式流动
-            float3 dir = normalize(_FlowDirection);
-            float3 curl = curlNoise(p.position.xyz * _FlowNoiseScale);
-            acceleration += dir * 1.0 + curl * _FlowNoiseStrength;
-            if (_FlowDragBoost > 0.0)
-            {
-                p.velocity.xyz *= (1.0 - _FlowDragBoost * _DeltaTime);
-            }
-        }
-        else if (_RingOrbitEnabled)
-        {
-            // 将粒子拉向环面并赋予切向速度，形成类似星环的轨道运动
-            float3 axis = normalize(_RingAxis);
-            // 投影到环平面
-            float3 toCenter = p.position.xyz - _RingCenter;
-            float planeDist = dot(toCenter, axis);
-            float3 inPlane = toCenter - planeDist * axis;
-            float distInPlane = length(inPlane);
-            float3 dirInPlane = distInPlane > 1e-5 ? inPlane / distInPlane : float3(1,0,0);
+            float armFalloff = exp(-abs(signedErr) * 4.0) * smoothstep(1.0, 0.0, r / _DiskRadius);
+            float3 normalDir = normalize(tangent * (-sign(signedErr)) + (-_SpiralTightness) * radialDir * (-sign(signedErr)));
+            acceleration += normalDir * _SpiralForce * armFalloff;
 
-            // 向环半径处的径向弹簧力（把粒子吸到理想半径）
-            float radialError = distInPlane - _RingRadius;
-            float3 radialForce = -dirInPlane * radialError * _RingGravity;
-
-            // 拉回到环平面（消除法向偏移）
-            float3 planeForce = -axis * planeDist * _RingPlaneDamping;
-
-            // 切向速度（右手正交：轴 × 径向）
-            float3 tangent = normalize(cross(axis, dirInPlane));
-            float desiredSpeed = sqrt(max(0.0, _RingGravity * _RingRadius)) * _OrbitSpeedScale;
-            float3 orbitVel = tangent * desiredSpeed;
-
-            acceleration += radialForce + planeForce;
-            // 轻度趋向切向速度
-            p.velocity.xyz = lerp(p.velocity.xyz, orbitVel, 0.04);
-        }
-        else if (_CurlNoiseEnabled)
-        {
-            float3 curl = curlNoise(p.position.xyz * _CurlNoiseScale);
-            acceleration += curl * _CurlNoiseStrength;
+            // 离心外飘：vt^2/r 与中心引力的差，边缘增强
+            float vt = dot(p.velocity.xyz, tangent);
+            float outAcc = max(0.0, (vt*vt - _CenterGravity) / r);
+            float r01 = saturate(r / _DiskRadius);
+            float edgeWeight = pow(r01, _EdgeOutflowExponent);
+            acceleration += radialDir * outAcc * _EdgeOutflowStrength * edgeWeight;
         }
 
         // （调试加速度捕获已移除）
@@ -292,7 +270,14 @@ void Simulate(uint3 id : SV_DispatchThreadID)
         p.position.xyz += p.velocity.xyz * _DeltaTime;
         
         float life_ratio = saturate(p.lifetime.x / p.lifetime.y);
-        if (_VelocityToColor) { float speed=length(p.velocity.xyz); float speedRatio=saturate(speed/_MaxSpeedForColor); float3 velocityColor=lerp(float3(0,0,1),float3(1,0,0),speedRatio); p.color.rgb=velocityColor; }
+        if (_RadialColorEnabled)
+        {
+            float r01 = saturate(length(float3(p.position.x,0,p.position.z)) / _DiskRadius);
+            float3 c = lerp(_CoreColor, _MidColor, saturate(r01*1.5));
+            c = lerp(c, _OuterColor, saturate(max(0,r01-0.5)*2.0));
+            p.color.rgb = c;
+        }
+        else if (_VelocityToColor) { float speed=length(p.velocity.xyz); float speedRatio=saturate(speed/_MaxSpeedForColor); float3 velocityColor=lerp(float3(0,0,1),float3(1,0,0),speedRatio); p.color.rgb=velocityColor; }
         else if (_ColorOverLife) { p.color.rgb = lerp(p.color.rgb, float3(1,1,0), life_ratio*0.5); }
         p.color.a = 1.0 - life_ratio;
         
