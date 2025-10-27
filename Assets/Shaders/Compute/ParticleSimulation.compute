@@ -13,25 +13,11 @@ struct Particle
     float4 position; 
     float4 color; 
     float4 attributes; 
-    uint globalId;        // 全局唯一ID
-    uint padding1;        // 内存对齐
-    uint padding2;       // 内存对齐
-    uint padding3;       // 内存对齐
+    uint globalId;        // global unique id
+    uint padding1;        // padding
+    uint padding2;        // padding
+    uint padding3;        // padding
 };
-
-struct Emitter 
-{
-    float4 position;
-    float4 initialVelocity;
-    float4 speedMinMax;
-    float4 color;
-    float4 ratesAndEnabled;
-};
-
-// 旧力场/多涡旋结构已移除
-
-// （调试结构已移除）
-
 
 // --- Buffers ---
 RWStructuredBuffer<Particle> _Particles;
@@ -40,16 +26,13 @@ RWStructuredBuffer<uint> _AliveIndices_A;
 RWStructuredBuffer<uint> _AliveIndices_B;
 RWStructuredBuffer<uint> _Counters;
 RWStructuredBuffer<uint> _IndirectArgs;
-RWStructuredBuffer<uint> _GlobalIdCounter;  // 全局ID计数器
-StructuredBuffer<Emitter> _Emitters;
-// （调试缓冲区已移除）
+RWStructuredBuffer<uint> _GlobalIdCounter;  // global id counter
 
 // --- Uniforms ---
 float _DeltaTime;
 uint _PingPong_A;
 uint _PingPong_B;
 uint _EmissionCount;
-uint _EmitterIndex;
 float _MinLifetime;
 float _MaxLifetime;
 float _Drag;
@@ -59,26 +42,45 @@ bool _ColorOverLife;
 bool _VelocityToColor;
 float _MaxSpeedForColor;
 
-// Galactic Disk uniforms
-bool _GalacticDiskEnabled;
-float _DiskRadius;
-float _DiskHalfThickness;
-float _CenterGravity;
-float _PlaneDamping;
-float _FlatRotationSpeed;
-float _RotationScaleRadius;
-int _SpiralArms;
-float _SpiralTightness; // b
-float _SpiralForce;
-float _TangentialAlign;
-// Radial color mapping
-bool _RadialColorEnabled;
-float3 _CoreColor;
-float3 _MidColor;
-float3 _OuterColor;
-// Edge centrifugal drift
-float _EdgeOutflowStrength;
-float _EdgeOutflowExponent;
+// Spherical-only uniforms
+float3 _SphereCenter;
+float _SphereRadius;
+float _ShellThickness;
+int _SphereVelocityMode;   // 0=RadialOut,1=RadialIn,2=Tangential,3=RadialPlusSwirl
+float _RadialSpeed;
+float _TangentialSpeed;
+float _SwirlSpeed;
+float _GravityK;
+float _RadialDamping;
+int _SphereBoundaryMode;   // 0=None,1=SurfaceStick,2=ShellClamp
+float _BoundarySpring;
+float _BoundaryDamping;
+bool _SphereColorByRadiusEnabled;
+float3 _SphereInnerColor;
+float3 _SphereMidColor;
+float3 _SphereOuterColor;
+float3 _BaseColor;
+// Temperature
+bool _TemperatureColorEnabled;
+float _TemperatureC;
+float3 _TempColorLow;
+float3 _TempColorHigh;
+// Mouse Attractor
+bool _MouseAttractorEnabled;
+float3 _MouseWorldPos;
+float _MouseAttractorStrength;
+float _MouseAttractorFalloff;
+float _MouseAttractorDragBoost;
+bool _EmitFromMouse;
+float _MouseEmissionSpeed;
+float _MouseAttractorStrengthMouseFactor;
+bool _MouseParticlesIgnoreCenterGravity;
+float _MouseEmitJitterSpeed;
+float _MouseBornExtraDamping;
+float _MouseBornMaxSpeed;
+bool _AllowShellBreakToMouse;
+
+// Ring uniforms removed
 
 // --- Utility Functions ---
 float rand(float2 co) 
@@ -94,6 +96,14 @@ float3 SafeNormalize(float3 v)
         return v / l; 
     } 
     return float3(0, 1, 0); 
+}
+
+// Build stable tangent basis orthogonal to normal
+void BuildOrthonormalBasis(float3 n, out float3 t, out float3 b)
+{
+	float3 a = (abs(n.y) < 0.999f) ? float3(0,1,0) : float3(1,0,0);
+	t = normalize(cross(a, n));
+	b = cross(n, t);
 }
 
 // --- Noise Functions ---
@@ -141,7 +151,6 @@ void Emit(uint3 id : SV_DispatchThreadID)
     } 
     
     uint p_idx = _DeadPool[dead_count-1]; 
-    Emitter emitter = _Emitters[_EmitterIndex]; 
     
     // 分配全局唯一ID
     uint global_id;
@@ -153,44 +162,61 @@ void Emit(uint3 id : SV_DispatchThreadID)
     p.velocity = float4(0, 0, 0, 0); 
     p.position = float4(0, 0, 0, 1); 
     p.color = float4(1, 1, 1, 1); 
-    p.attributes = float4(_EmitterIndex, 0, 0, 0); // 将emitterId存储在attributes.x中
+    p.attributes = float4(0, 0, 0, 0);
     p.globalId = global_id;  // 设置全局唯一ID
     p.padding1 = 0;
     p.padding2 = 0;
     p.padding3 = 0;
     
-    // 设置发射器参数
-    float3 emitter_pos = emitter.position.xyz; 
-    float emitter_radius = emitter.position.w; 
-    float min_speed = emitter.speedMinMax.x; 
-    float max_speed = emitter.speedMinMax.y; 
-    
-    // 薄盘内采样（r ~ sqrt(u)）
-    float u1 = rand(id.xy + _Seeds.xy * 0.37);
-    float u2 = rand(id.yx + _Seeds.yz * 0.71);
-    float r = sqrt(u1) * _DiskRadius;
-    float theta = 6.28318530718 * u2;
-    float y = (rand(id.xy + _Seeds.zx * 0.13) - 0.5) * 2.0 * _DiskHalfThickness;
-    float3 pos = float3(cos(theta) * r, y, sin(theta) * r);
-    p.position = float4(pos + emitter_pos, 1.0);
-    // 切向初速（随半径上升并趋于平坦）
-    float desiredSpeed = _FlatRotationSpeed * (1.0 - exp(-r / max(1e-3, _RotationScaleRadius)));
-    float3 radialDir = normalize(float3(cos(theta), 0, sin(theta)));
-    float3 tangent = float3(-radialDir.z, 0, radialDir.x);
-    float3 v0 = tangent * desiredSpeed;
-    // 少量噪声
-    float3 noise = (float3(rand(id.xy), rand(id.yx), rand(id.xx)) - 0.5) * 0.2 * desiredSpeed;
-    p.velocity = float4(v0 + noise, 0);
-    p.color = emitter.color; 
+    {
+        // 球壳采样
+        float u1 = rand(id.xy + _Seeds.xy * 0.19);
+        float u2 = rand(id.yx + _Seeds.yz * 0.61);
+        float u3 = rand(id.xx + _Seeds.zx * 0.83);
+        // 均匀方向
+        float z = 2.0 * u1 - 1.0;
+        float phi = 6.28318530718 * u2;
+        float s = sqrt(max(0.0, 1.0 - z*z));
+        float3 dir = float3(s * cos(phi), z, s * sin(phi));
+        // 半径（仅壳体）
+        float innerR = max(0.0, _SphereRadius - _ShellThickness);
+        float r = lerp(innerR, _SphereRadius, u3);
+        float3 pos = _SphereCenter + dir * r;
+        if (_EmitFromMouse)
+        {
+            pos = _MouseWorldPos;
+        }
+        p.position = float4(pos, 1.0);
+        // 初速度
+        float3 t, b; BuildOrthonormalBasis(dir, t, b);
+        float3 v0 = 0;
+        if (_SphereVelocityMode == 0) { v0 = dir * _RadialSpeed; }
+        else if (_SphereVelocityMode == 1) { v0 = (-dir) * _RadialSpeed; }
+        else if (_SphereVelocityMode == 2) { v0 = t * _TangentialSpeed; }
+        else { v0 = dir * _RadialSpeed + t * _SwirlSpeed; }
+        if (_EmitFromMouse)
+        {
+            float3 rnd = float3(rand(id.xy*1.7), rand(id.yx*2.3), rand(id.xx*3.1)) - 0.5;
+            float3 jitter = normalize(rnd) * _MouseEmitJitterSpeed;
+            float3 vel = jitter; // 仅轻微抖动，避免外逃
+            p.velocity = float4(vel, 0);
+            p.attributes.w = 1.0; // 标记为鼠标粒子
+        }
+        else
+        {
+            p.velocity = float4(v0, 0);
+            p.attributes.w = 0.0;
+        }
+        p.color = float4(_BaseColor, 1.0);
+    }
     
     _Particles[p_idx] = p; 
     
     uint alive_insert_idx; 
     InterlockedAdd(_Counters[_PingPong_A], 1, alive_insert_idx); 
     _AliveIndices_A[alive_insert_idx] = p_idx; 
-
-    // （调试写入已移除）
 }
+
 [numthreads(THREAD_COUNT_1D, 1, 1)]
 void Simulate(uint3 id : SV_DispatchThreadID)
 {
@@ -199,8 +225,6 @@ void Simulate(uint3 id : SV_DispatchThreadID)
 
     uint p_idx = _AliveIndices_A[id.x];
     Particle p = _Particles[p_idx];
-
-    // （调试初始化已移除）
 
     p.lifetime.x += _DeltaTime;
 
@@ -213,68 +237,86 @@ void Simulate(uint3 id : SV_DispatchThreadID)
     else
     {
         float3 acceleration = _GlobalForce;
-        if (_GalacticDiskEnabled)
+        float3 pos = p.position.xyz;
+        float3 toCenter = _SphereCenter - pos;
+        float dist = length(toCenter) + 1e-4;
+        float3 dir = toCenter / dist;
+        bool isMouse = (p.attributes.w > 0.5);
+        // 中心吸引力 ~ 1/r^2（鼠标粒子可忽略）
+        if (!(isMouse && _MouseParticlesIgnoreCenterGravity))
         {
-            float3 pos = p.position.xyz;
-            float3 inPlane = float3(pos.x, 0, pos.z);
-            float r = max(1e-3, length(inPlane));
-            float3 radialDir = inPlane / r;
-            float3 tangent = float3(-radialDir.z, 0, radialDir.x);
-
-            // 中心引力 ~ 1/r
-            float radialG = _CenterGravity / r;
-            acceleration += -radialDir * radialG;
-            // 拉回盘面
-            acceleration += float3(0, -pos.y * _PlaneDamping, 0);
-
-            // 目标切向速度（差速旋转）
-            float desiredSpeed = _FlatRotationSpeed * (1.0 - exp(-r / max(1e-3, _RotationScaleRadius)));
-            float3 vDesired = tangent * desiredSpeed;
-            float r01_align = saturate(r / _DiskRadius);
-            float alignFactor = _TangentialAlign * (1.0 - 0.4 * (r01_align*r01_align)); // 外缘稍减对齐
-            p.velocity.xyz = lerp(p.velocity.xyz, vDesired, alignFactor);
-
-            // 螺旋臂压缩（对数螺旋 theta = b*ln(r)+phi_k）
-            float theta = atan2(pos.z, pos.x);
-            float minAbsErr = 1000.0;
-            float signedErr = 0.0;
-            for (int k = 0; k < max(1,_SpiralArms); k++)
-            {
-                float phi = 6.28318530718 * (float)k / max(1,_SpiralArms);
-                float target = _SpiralTightness * log(r) + phi;
-                float err = theta - target;
-                // wrap to [-pi, pi]
-                err = err - 6.28318530718 * round(err / 6.28318530718);
-                if (abs(err) < minAbsErr)
-                {
-                    minAbsErr = abs(err);
-                    signedErr = err;
-                }
-            }
-            float armFalloff = exp(-abs(signedErr) * 4.0) * smoothstep(1.0, 0.0, r / _DiskRadius);
-            float3 normalDir = normalize(tangent * (-sign(signedErr)) + (-_SpiralTightness) * radialDir * (-sign(signedErr)));
-            acceleration += normalDir * _SpiralForce * armFalloff;
-
-            // 离心外飘：vt^2/r 与中心引力的差，边缘增强
-            float vt = dot(p.velocity.xyz, tangent);
-            float outAcc = max(0.0, (vt*vt - _CenterGravity) / r);
-            float r01 = saturate(r / _DiskRadius);
-            float edgeWeight = pow(r01, _EdgeOutflowExponent);
-            acceleration += radialDir * outAcc * _EdgeOutflowStrength * edgeWeight;
+            acceleration += dir * (_GravityK / (dist * dist));
         }
 
-        // （调试加速度捕获已移除）
+        // 鼠标吸引力
+        if (_MouseAttractorEnabled)
+        {
+            float3 toMouse = _MouseWorldPos - p.position.xyz;
+            float d = length(toMouse) + 1e-4;
+            float3 dirM = toMouse / d;
+            float baseK = _MouseAttractorStrength / pow(d, max(0.1, _MouseAttractorFalloff));
+            float k = baseK * (isMouse ? _MouseAttractorStrengthMouseFactor : 1.0);
+            acceleration += dirM * k;
+            p.velocity.xyz *= (1.0 - (_MouseAttractorDragBoost + _MouseBornExtraDamping * (isMouse?1.0:0.0)) * _DeltaTime);
+        }
+
+        if (!isMouse)
+        {
+            // 径向速度阻尼（抑制穿壳与抖动）
+            float radialV = dot(p.velocity.xyz, -dir); // 与半径方向同向的速度
+            if (!_AllowShellBreakToMouse || !_MouseAttractorEnabled)
+            {
+                p.velocity.xyz -= (-dir) * radialV * _RadialDamping;
+            }
+
+            // 壳体夹回
+            if (_SphereBoundaryMode == 1 && (!_AllowShellBreakToMouse || !_MouseAttractorEnabled))
+            {
+                float targetR = _SphereRadius;
+                float offset = dist - targetR;
+                acceleration += (-dir) * (offset * _BoundarySpring);
+                p.velocity.xyz -= (-dir) * radialV * _BoundaryDamping;
+            }
+            else if (_SphereBoundaryMode == 2 && (!_AllowShellBreakToMouse || !_MouseAttractorEnabled))
+            {
+                float innerR = max(0.0, _SphereRadius - _ShellThickness);
+                float outerR = _SphereRadius;
+                float offset = 0.0;
+                if (dist < innerR) offset = dist - innerR; // 负值，推向外
+                else if (dist > outerR) offset = dist - outerR; // 正值，推向内
+                if (offset != 0.0)
+                {
+                    acceleration += (-dir) * (offset * _BoundarySpring);
+                    p.velocity.xyz -= (-dir) * radialV * _BoundaryDamping;
+                }
+            }
+        }
+
 
         p.velocity.xyz += acceleration * _DeltaTime;
+        // 鼠标粒子速度限制
+        if (isMouse)
+        {
+            float sp = length(p.velocity.xyz);
+            if (sp > _MouseBornMaxSpeed)
+            {
+                p.velocity.xyz *= (_MouseBornMaxSpeed / sp);
+            }
+        }
         p.velocity.xyz *= (1.0 - _Drag * _DeltaTime);
         p.position.xyz += p.velocity.xyz * _DeltaTime;
         
         float life_ratio = saturate(p.lifetime.x / p.lifetime.y);
-        if (_RadialColorEnabled)
+        if (_TemperatureColorEnabled)
         {
-            float r01 = saturate(length(float3(p.position.x,0,p.position.z)) / _DiskRadius);
-            float3 c = lerp(_CoreColor, _MidColor, saturate(r01*1.5));
-            c = lerp(c, _OuterColor, saturate(max(0,r01-0.5)*2.0));
+            float t01 = saturate((_TemperatureC - 20.0) / 10.0); // 20~30 -> 0~1
+            p.color.rgb = lerp(_TempColorLow, _TempColorHigh, t01);
+        }
+        else if (_SphereColorByRadiusEnabled)
+        {
+            float r01 = saturate(distance(p.position.xyz, _SphereCenter) / max(1e-4, _SphereRadius));
+            float3 c = lerp(_SphereInnerColor, _SphereMidColor, saturate(r01*1.5));
+            c = lerp(c, _SphereOuterColor, saturate(max(0,r01-0.5)*2.0));
             p.color.rgb = c;
         }
         else if (_VelocityToColor) { float speed=length(p.velocity.xyz); float speedRatio=saturate(speed/_MaxSpeedForColor); float3 velocityColor=lerp(float3(0,0,1),float3(1,0,0),speedRatio); p.color.rgb=velocityColor; }
@@ -287,7 +329,5 @@ void Simulate(uint3 id : SV_DispatchThreadID)
         InterlockedAdd(_Counters[_PingPong_B], 1, alive_insert_idx);
         _AliveIndices_B[alive_insert_idx] = p_idx;
         InterlockedAdd(_IndirectArgs[1], 1);
-
-        // （调试输出写入已移除）
     }
 }

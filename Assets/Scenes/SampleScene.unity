@@ -177,7 +177,7 @@ Camera:
     y: 0
     width: 1
     height: 1
-  near clip plane: 0.3
+  near clip plane: 0.1
   far clip plane: 1000
   field of view: 60
   orthographic: 0
@@ -205,8 +205,8 @@ Transform:
   m_PrefabAsset: {fileID: 0}
   m_GameObject: {fileID: 330585543}
   serializedVersion: 2
-  m_LocalRotation: {x: 0, y: 0, z: 0, w: 1}
-  m_LocalPosition: {x: 0, y: 5, z: -300}
+  m_LocalRotation: {x: 0.20906463, y: 0.252684, z: -0.0560187, w: 0.9430295}
+  m_LocalPosition: {x: -47.387463, y: 44.194275, z: -82.07749}
   m_LocalScale: {x: 1, y: 1, z: 1}
   m_ConstrainProportionsScale: 0
   m_Children: []
@@ -455,35 +455,49 @@ MonoBehaviour:
   m_Script: {fileID: 11500000, guid: 0fe47259303f6ae4f92f4fd7238a0f8e, type: 3}
   m_Name: 
   m_EditorClassIdentifier: 
-  emitters:
-  - name: Red
-    enabled: 1
-    emissionRate: 5000
-    position: {x: 0, y: 0, z: 0}
-    radius: 50
-    initialVelocity: {x: 0, y: 0, z: 0}
-    minInitialSpeed: 1
-    maxInitialSpeed: 2
-    color: {r: 1, g: 0, b: 0, a: 0}
+  globalEmissionRate: 8000
+  baseColor: {r: 1, g: 1, b: 1, a: 1}
+  mouseAttractorEnabled: 1
+  mouseAttractorStrength: 120
+  mouseAttractorFalloff: 1
+  mouseAttractorDragBoost: 0
+  mouseAttractorStrengthMouseFactor: 2.5
+  mouseParticlesIgnoreCenterGravity: 1
+  mouseEmissionRate: 2000
+  mouseEmissionSpeed: 6
+  mouseEmitJitterSpeed: 0.3
+  mouseBornExtraDamping: 2
+  mouseBornMaxSpeed: 2
+  allowShellBreakToMouse: 1
+  mousePlaneY: 0
   globalForce: {x: 0, y: 0, z: 0}
-  galacticDiskEnabled: 1
-  diskRadius: 150
-  diskHalfThickness: 3
-  centerGravity: 20
-  planeDamping: 3
-  flatRotationSpeed: 25
-  rotationScaleRadius: 50
-  spiralArms: 3
-  spiralTightness: 1.2
-  spiralForce: 6
-  tangentialAlign: 0.06
-  radialColorEnabled: 1
-  coreColor: {r: 1, g: 0.95, b: 0.7, a: 1}
-  midColor: {r: 0.75, g: 0.7, b: 0.9, a: 1}
-  outerColor: {r: 0.45, g: 0.5, b: 0.65, a: 1}
-  minLifetime: 8
-  maxLifetime: 12
-  drag: 0.1
+  sphereCenter: {x: 0, y: 0, z: 0}
+  sphereRadius: 50
+  shellThickness: 4
+  sphereVelocityMode: 3
+  radialSpeed: 1.5
+  tangentialSpeed: 1.5
+  swirlSpeed: 3.5
+  gravityK: 10
+  radialDamping: 0.35
+  sphereBoundaryMode: 2
+  boundarySpring: 10
+  boundaryDamping: 2
+  shellEmissionPulseEnabled: 1
+  shellEmissionMin: 1000
+  shellEmissionMax: 8000
+  shellEmissionHalfPeriod: 3
+  sphereColorByRadiusEnabled: 1
+  sphereInnerColor: {r: 0.98, g: 0.98, b: 1, a: 1}
+  sphereMidColor: {r: 0.72, g: 0.86, b: 1, a: 1}
+  sphereOuterColor: {r: 0.32, g: 0.54, b: 0.98, a: 1}
+  temperatureColorEnabled: 1
+  temperatureC: 25
+  tempColorLow: {r: 0, g: 0, b: 1, a: 1}
+  tempColorHigh: {r: 1, g: 0, b: 0, a: 1}
+  minLifetime: 12
+  maxLifetime: 18
+  drag: 0.12
   colorOverLife: 0
   velocityToColor: 1
   maxSpeedForColor: 20
@@ -498,6 +512,10 @@ MonoBehaviour:
   forceBlackBackground: 1
   backgroundColor: {r: 0, g: 0, b: 0, a: 1}
   disablePostProcessing: 1
+  autoFrameCameraOnStart: 1
+  cameraElevationDeg: 25
+  cameraYawDeg: 30
+  cameraMargin: 1.15
 --- !u!4 &1414393514
 Transform:
   m_ObjectHideFlags: 0
